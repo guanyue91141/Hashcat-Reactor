@@ -1,4 +1,4 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, Menu } = require('electron');
 const path = require('path');
 const { fork } = require('child_process');
 
@@ -80,6 +80,9 @@ function startServer() {
 }
 
 app.whenReady().then(() => {
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+  }
   startServer();
   createWindow();
 
