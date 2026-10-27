@@ -67,18 +67,13 @@
           "to": "backend",
           "filter": [
             "**/*",
+            "!uploads/**",
+            "!pp.save",
             "!hashcat/hashcat.bin",
             "!hashcat/modules/*.so",
             "!hashcat/bridges/*.so",
             "!john/linux/**",
             "!john/darwin/**"
-          ]
-        },
-        {
-          "from": "pebble-client/config",
-          "to": "pebble-client/config",
-          "filter": [
-            "**/*"
           ]
         }
       ]
@@ -95,19 +90,14 @@
           "to": "backend",
           "filter": [
             "**/*",
+            "!uploads/**",
+            "!pp.save",
             "!hashcat/hashcat.exe",
             "!hashcat/hashcat.bin",
             "!hashcat/modules/*.dll",
             "!hashcat/bridges/*.dll",
             "!john/win32/**",
             "!john/linux/**"
-          ]
-        },
-        {
-          "from": "pebble-client/config",
-          "to": "pebble-client/config",
-          "filter": [
-            "**/*"
           ]
         }
       ]
@@ -125,18 +115,13 @@
           "to": "backend",
           "filter": [
             "**/*",
+            "!uploads/**",
+            "!pp.save",
             "!hashcat/hashcat.exe",
             "!hashcat/modules/*.dll",
             "!hashcat/bridges/*.dll",
             "!john/win32/**",
             "!john/darwin/**"
-          ]
-        },
-        {
-          "from": "pebble-client/config",
-          "to": "pebble-client/config",
-          "filter": [
-            "**/*"
           ]
         }
       ]

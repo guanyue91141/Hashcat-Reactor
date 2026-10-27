@@ -1,6 +1,5 @@
 const express = require('express');
 const http = require('http');
-const https = require('https');
 const { Server } = require('socket.io');
 const { spawn, exec, spawnSync } = require('child_process');
 const cors = require('cors');
@@ -551,60 +550,9 @@ app.post('/api/tools/file2john', upload.single('file'), (req, res) => {
     proc.on('error', (err) => res.status(500).json({ message: 'Spawn error', error: err.message }));
 });
 
-let zrokProcess = null;
-let remoteConfig = { active: false, url: null, username: '', password: '' };
-let staticPath = process.env.FRONTEND_BUILD_PATH;
-if (!staticPath || !fs.existsSync(staticPath)) {
-    const parentTry = path.join(__dirname, '../../dist'); 
-    if (fs.existsSync(parentTry)) staticPath = parentTry;
-    else {
-        const currentTry = path.join(__dirname, '../dist');
-        if (fs.existsSync(currentTry)) staticPath = currentTry;
-    }
-}
-if (staticPath && fs.existsSync(staticPath)) app.use(express.static(staticPath));
-
 // Stores session objects. 
 const activeSessions = {}; 
 let sessionCounter = 0; 
-let currentGlobalPower = 0;
-let currentMaxTemp = 0;
-let currentGpus = [];   // [{ index, name, watts, temp }] from the latest poll
-
-// Per-session live stats the Pebble companion polls. These are populated
-// alongside the Socket.IO emissions so the watchapp can show the same
-// numbers without needing a Socket.IO connection.
-const liveStats = {}; // sessionId -> { timeEstimatedSec, hashrate, progressPercent, lastUpdated }
-
-function setLiveStat(sessionId, key, value) {
-    if (!sessionId) return;
-    if (!liveStats[sessionId]) liveStats[sessionId] = { timeEstimatedSec: 0, hashrate: 0, progressPercent: 0, lastUpdated: Date.now() };
-    liveStats[sessionId][key] = value;
-    liveStats[sessionId].lastUpdated = Date.now();
-}
-
-// Convert hashcat's "Time.Estimated" string into seconds.
-// Examples: "5d 12h", "1h 23m", "30 mins, 45 secs", "0 secs", "2 days, 3 hours".
-function parseHashcatTimeToSec(s) {
-    if (!s) return 0;
-    s = String(s).toLowerCase();
-    if (s.includes('remaining') || s === '0 secs' || s === '0 sec' || s === '0s') return 0;
-    let total = 0;
-    const re = /(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/g;
-    let m;
-    let matched = false;
-    while ((m = re.exec(s)) !== null) {
-        matched = true;
-        const v = parseInt(m[1], 10);
-        const u = m[2];
-        if (u.startsWith('d')) total += v * 86400;
-        else if (u.startsWith('h')) total += v * 3600;
-        else if (u.startsWith('m')) total += v * 60;
-        else if (u.startsWith('s')) total += v;
-    }
-    return matched ? total : 0;
-}
-
 const uuid = () => Math.random().toString(36).substring(2, 9);
 
 const getHashcatConfig = () => {
@@ -687,43 +635,6 @@ const findPotfileMatchesForTarget = async (targetPath, potfilePath) => {
     return { total, matches };
 };
 
-const getFullPotfile = () => {
-    if (!fs.existsSync(POTFILE_PATH)) return [];
-    try {
-        const content = fs.readFileSync(POTFILE_PATH, 'utf-8');
-        return content.split('\n').map(line => {
-            const parsed = parsePotfileLine(line);
-            if (parsed) {
-                return {
-                    id: uuid(),
-                    hash: parsed.hash,
-                    plain: parsed.plain,
-                    algorithmId: '0', 
-                    timestamp: Date.now(),
-                    sentToEscrow: false
-                };
-            }
-            return null;
-        }).filter(item => item !== null);
-    } catch (e) { return []; }
-};
-
-// Rolling buffer of the most recently cracked plaintexts, surfaced to the
-// Pebble watch's RECOVERED card and crack feed. Each entry records when the
-// crack landed. Newest is pushed last; capped small.
-const recentPlains = [];
-function pushRecentPlain(plain) {
-    if (plain === undefined || plain === null || plain === '') return;
-    recentPlains.push({ plain: String(plain), at: Date.now() });
-    while (recentPlains.length > 8) recentPlains.shift();
-}
-
-// Recent plaintexts are per-run; once no session is active, clear them so the
-// Pebble RECOVERED card stops showing cracks from a finished session.
-function clearRecentPlainsIfIdle() {
-    if (Object.keys(activeSessions).length === 0) recentPlains.length = 0;
-}
-
 app.post('/api/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
     res.json({ path: req.file.path });
@@ -740,388 +651,6 @@ app.post('/api/target', (req, res) => {
     } catch (e) { res.status(500).json({ message: 'Write failed' }); }
 });
 
-app.get('/api/remote/status', (req, res) => res.json(remoteConfig));
-
-// === PEBBLE WATCHAPP BRIDGE ===
-//
-// A read-only state endpoint polled by the Pebble companion (PebbleKit JS).
-// The watch itself is too constrained to subscribe to Socket.IO, and we want
-// to expose the same numbers the React UI sees, in a single JSON response.
-
-// hashcat mode -> algorithm name. Parsed once from the frontend's HASH_TYPES
-// list (the single source of truth) so the Pebble companion can show a real
-// algorithm name (e.g. "SHA2-256") instead of a bare mode number ("mode 1400")
-// when a session has no algorithmName set.
-const HASH_NAME_BY_ID = (() => {
-    // hash_names.json sits next to server.js and is shipped (extraResources copies
-    // the whole backend/ dir), so it resolves in packaged builds where the source
-    // constants.ts is not present. Regenerate it from constants.ts if hash modes
-    // change: node -e "...parse constants.ts -> backend/hash_names.json".
-    try {
-        const jsonPath = path.join(__dirname, 'hash_names.json');
-        if (fs.existsSync(jsonPath)) {
-            const map = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
-            if (map && Object.keys(map).length > 0) {
-                console.log(`[PEBBLE] Loaded ${Object.keys(map).length} hash-type names from hash_names.json`);
-                return map;
-            }
-        }
-    } catch (e) { /* fall back to parsing constants.ts */ }
-
-    // Dev fallback: parse the source-of-truth constants.ts directly.
-    const candidates = [
-        path.join(__dirname, '..', 'constants.ts'),
-        path.join(process.cwd(), 'constants.ts'),
-        RESOURCES_PATH ? path.join(RESOURCES_PATH, 'constants.ts') : null,
-    ].filter(Boolean);
-    for (const file of candidates) {
-        try {
-            if (!fs.existsSync(file)) continue;
-            const txt = fs.readFileSync(file, 'utf-8');
-            const map = {};
-            const re = /id:\s*'([^']+)'\s*,\s*name:\s*'([^']*)'/g;
-            let m;
-            while ((m = re.exec(txt)) !== null) map[m[1]] = m[2];
-            if (Object.keys(map).length > 0) {
-                console.log(`[PEBBLE] Loaded ${Object.keys(map).length} hash-type names from ${path.basename(file)}`);
-                return map;
-            }
-        } catch (e) { /* try next candidate */ }
-    }
-    console.warn('[PEBBLE] Could not load HASH_TYPES names; Pebble will show mode numbers.');
-    return {};
-})();
-
-function resolveAlgoName(s) {
-    if (s.algorithmName) return s.algorithmName;
-    if (s.hashType == null) return null;
-    return HASH_NAME_BY_ID[String(s.hashType)] || ('mode ' + s.hashType);
-}
-
-// Cumulative session-history series for the Pebble INSIGHTS card. Mirrors the
-// web Insights "cumulativeGrowthData": walk completed sessions oldest->newest
-// accumulating recovered count and energy (Wh = powerUsage W * hours). Cost is
-// rate-dependent so it's derived on the phone (PKJS) from energyWh; here we
-// only emit the rate-free series. Capped to the most recent points.
-function getPebbleGrowth() {
-    let sessions = [];
-    if (fs.existsSync(SESSIONS_PATH)) {
-        try { sessions = JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf-8')); } catch (e) {}
-    }
-    sessions = (sessions || [])
-        .filter(s => s && s.date)
-        .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-    let rec = 0, wh = 0;
-    const recovered = [], energyWh = [];
-    sessions.forEach(s => {
-        rec += s.recovered || 0;
-        wh  += (s.powerUsage || 0) * ((s.duration || 0) / 3600);
-        recovered.push(rec);
-        energyWh.push(Math.round(wh));
-    });
-    const N = 48;
-    return { recovered: recovered.slice(-N), energyWh: energyWh.slice(-N) };
-}
-
-app.get('/api/pebble/state', (req, res) => {
-    const sessions = Object.entries(activeSessions).map(([id, s]) => {
-        const live = liveStats[id] || {};
-        const st = s.stats || {};
-        const speeds = st.latestSpeeds || {};
-        // Aggregate H/s: prefer the "*" device line if present, else sum numeric devices.
-        let aggregateHs = speeds['*'] || 0;
-        if (!aggregateHs) {
-            aggregateHs = Object.entries(speeds)
-                .filter(([k]) => !isNaN(parseInt(k)))
-                .reduce((acc, [, v]) => acc + v, 0);
-        }
-        const avgHs = st.hashrateCount > 0 ? (st.hashrateSum / st.hashrateCount) : 0;
-        const avgPwr = st.powerReadings > 0 ? (st.powerSum / st.powerReadings) : 0;
-        const out = {
-            id,
-            name: s.name,
-            type: s.type,
-            isWorkflow: !!s.isWorkflow,
-            startTime: s.startTime,
-            uptimeSec: s.startTime ? Math.floor((Date.now() - s.startTime) / 1000) : 0,
-            hashType: s.hashType || null,
-            attackMode: s.attackMode || null,
-            algorithmName: resolveAlgoName(s),
-            status: s.status || 'RUNNING',
-            stats: {
-                recovered: st.recovered || 0,
-                recoveredCount: st.recoveredCount || 0,
-                total: st.total || 0,
-            },
-            hashrate: aggregateHs,                       // H/s
-            avgHashrate: avgHs,                          // H/s
-            avgPower: avgPwr,                            // W
-            progressPercent: live.progressPercent || 0,  // 0-100 keyspace progress
-            timeEstimatedSec: live.timeEstimatedSec || 0,
-            lastUpdated: live.lastUpdated || 0,
-        };
-        // Smart-workflow timeline pins: the watch should not pin every mask's
-        // live estimate. Instead expose two absolute finish times - the
-        // dictionary phase (phase 1, from hashcat's live estimate) and the
-        // complete mask attack (phase 3, anchored to its start + the
-        // precomputed all-masks runtime). Each is non-null only while its
-        // phase is active, so the watch pins exactly one phase at a time and
-        // retires the previous pin as the workflow advances.
-        if (s.isWorkflow) {
-            const wf = activeWorkflows[id] || {};
-            const nowMs = Date.now();
-            out.workflow = {
-                phase: wf.phase || 0,
-                dictFinishAt: (wf.phase === 1 && (live.timeEstimatedSec || 0) > 0)
-                    ? nowMs + live.timeEstimatedSec * 1000 : null,
-                maskFinishAt: (wf.phase === 3 && wf.phase3StartTime && (wf.maskEtaSec || 0) > 0)
-                    ? wf.phase3StartTime + wf.maskEtaSec * 1000 : null,
-            };
-        }
-        return out;
-    });
-
-    res.json({
-        now: Date.now(),
-        sessions,
-        escrow: getEscrowStats(),
-        globalPower: currentGlobalPower,
-        maxTemp: currentMaxTemp,
-        gpus: currentGpus.map(g => ({ index: g.index, temp: Math.round(g.temp || 0) })),
-        recentPlains: recentPlains.slice(-3).reverse().map(c => c.plain), // newest first, up to 3
-        recentCracks: recentPlains.slice(-8).reverse()
-            .map(c => ({ plain: c.plain, at: c.at })),  // timestamped feed, newest first
-        growth: getPebbleGrowth(),                      // cumulative history series
-    });
-});
-
-// Per-session escrow counters. Updated by the React UI via the
-// /api/pebble/escrow/record endpoint so the watchapp can show "submitted"
-// and running BTC totals without a second trip to hashes.com.
-const escrowStats = {}; // sessionId -> { submitted, btc, usd, lastSubmittedAt }
-
-function getEscrowStats() {
-    // Return a flat map plus a grand total.
-    let totalSubmitted = 0, totalBtc = 0, totalUsd = 0;
-    Object.values(escrowStats).forEach(e => {
-        totalSubmitted += e.submitted || 0;
-        totalBtc += e.btc || 0;
-        totalUsd += e.usd || 0;
-    });
-    return {
-        perSession: escrowStats,
-        totals: { submitted: totalSubmitted, btc: totalBtc, usd: totalUsd },
-    };
-}
-
-app.post('/api/pebble/escrow/record', (req, res) => {
-    const { sessionId, submitted, btc, usd } = req.body || {};
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-    if (!escrowStats[sessionId]) escrowStats[sessionId] = { submitted: 0, btc: 0, usd: 0, lastSubmittedAt: 0 };
-    if (typeof submitted === 'number') escrowStats[sessionId].submitted += submitted;
-    if (typeof btc === 'number') escrowStats[sessionId].btc += btc;
-    if (typeof usd === 'number') escrowStats[sessionId].usd += usd;
-    escrowStats[sessionId].lastSubmittedAt = Date.now();
-    res.json({ ok: true, escrow: escrowStats[sessionId] });
-});
-
-app.post('/api/pebble/escrow/clear', (req, res) => {
-    const { sessionId } = req.body || {};
-    if (sessionId) {
-        delete escrowStats[sessionId];
-    } else {
-        for (const k of Object.keys(escrowStats)) delete escrowStats[k];
-    }
-    res.json({ ok: true });
-});
-app.post('/api/remote/start', (req, res) => {
-    const { username, password } = req.body;
-    if (zrokProcess) return res.status(400).json({ message: 'Remote access already active' });
-    remoteConfig.username = username || '';
-    remoteConfig.password = password || '';
-    const args = ['share', 'public', `http://localhost:${PORT}`, '--headless'];
-    if (username && password) args.push('--basic-auth', `${username}:${password}`);
-    try {
-        zrokProcess = spawn('zrok', args);
-        remoteConfig.active = true;
-        const parseZrokOutput = (data) => {
-            const output = data.toString();
-            console.log(`[ZROK LOG] ${output}`);
-            const urlMatch = output.match(/https:\/\/[a-zA-Z0-9-]+\.share\.zrok\.io/);
-            if (urlMatch && (!remoteConfig.url || remoteConfig.url !== urlMatch[0])) {
-                console.log(`[ZROK] Captured URL: ${urlMatch[0]}`);
-                remoteConfig.url = urlMatch[0];
-                io.emit('remote_status_update', remoteConfig);
-            }
-        };
-        zrokProcess.stdout.on('data', parseZrokOutput);
-        zrokProcess.stderr.on('data', parseZrokOutput); 
-        zrokProcess.on('close', (code) => {
-            console.log(`[ZROK] Process exited with code ${code}`);
-            remoteConfig.active = false;
-            remoteConfig.url = null;
-            zrokProcess = null;
-            io.emit('remote_status_update', remoteConfig);
-        });
-        zrokProcess.on('error', (err) => {
-            console.error(`[ZROK FAIL] ${err.message}`);
-            remoteConfig.active = false;
-            io.emit('remote_status_update', remoteConfig);
-        });
-        res.json({ success: true, message: 'Initiating remote access...' });
-    } catch (e) {
-        console.error("Failed to spawn zrok", e);
-        res.status(500).json({ message: 'Failed to start zrok. Is it installed and in PATH?' });
-    }
-});
-
-app.post('/api/remote/stop', (req, res) => {
-    if (zrokProcess) { zrokProcess.kill(); zrokProcess = null; }
-    remoteConfig.active = false;
-    remoteConfig.url = null;
-    io.emit('remote_status_update', remoteConfig);
-    res.json({ success: true });
-});
-
-// --- PROXY HELPER FUNCTION ---
-const handleProxyRequest = (targetUrl, res, attempt = 1) => {
-    if (attempt > 5) return res.status(500).json({ error: "Too many redirects" });
-    let parsed;
-    try {
-        parsed = new URL(targetUrl);
-        if (!parsed.hostname.endsWith('hashes.com')) {
-             return res.status(403).json({ error: "Only hashes.com allowed" });
-        }
-    } catch (e) { return res.status(400).json({ error: "Invalid URL" }); }
-
-    const adapter = parsed.protocol === 'https:' ? https : http;
-    const reqOptions = { 
-        headers: { 
-            'User-Agent': 'python-requests/2.28.1', 
-            'Accept': '*/*',
-            'Accept-Encoding': 'identity', 
-            'Connection': 'keep-alive',
-            'Host': parsed.hostname 
-        } 
-    };
-
-    const proxyReq = adapter.get(targetUrl, reqOptions, (proxyRes) => {
-        if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-            let redirectUrl = proxyRes.headers.location;
-            if (!redirectUrl.startsWith('http')) {
-                const origin = `${parsed.protocol}//${parsed.hostname}`;
-                redirectUrl = redirectUrl.startsWith('/') ? `${origin}${redirectUrl}` : `${origin}/${redirectUrl}`;
-            }
-            return handleProxyRequest(redirectUrl, res, attempt + 1);
-        }
-        res.status(proxyRes.statusCode);
-        const headersToForward = ['content-type', 'content-length', 'content-disposition', 'last-modified', 'etag'];
-        headersToForward.forEach(h => { if(proxyRes.headers[h]) res.setHeader(h, proxyRes.headers[h]); });
-        proxyRes.pipe(res);
-    });
-    proxyReq.on('error', (e) => { 
-        console.error('Proxy Get Error:', e); 
-        if (!res.headersSent) res.status(500).json({ error: e.message }); 
-    });
-};
-
-app.get('/api/escrow/proxy', (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).json({ error: "Missing url parameter" });
-    handleProxyRequest(targetUrl, res);
-});
-
-// --- POST PROXY ---
-app.post('/api/escrow/proxy', (req, res) => {
-
-    if (req.headers['content-type'] && req.headers['content-type'].includes('application/json')) {
-        const { key, algo, fileContent } = req.body;
-        
-        if (!key || !algo || !fileContent) {
-             return res.status(400).json({ success: false, message: "Missing fields in JSON proxy request" });
-        }
-
-        const boundary = '----ReactBoundary' + Math.random().toString(36).slice(2);
-        
-        // Manually construct multipart body matching hashes.py: key, algo, userfile
-        let payload = '';
-        payload += `--${boundary}\r\nContent-Disposition: form-data; name="key"\r\n\r\n${key}\r\n`;
-        payload += `--${boundary}\r\nContent-Disposition: form-data; name="algo"\r\n\r\n${algo}\r\n`;
-        payload += `--${boundary}\r\nContent-Disposition: form-data; name="userfile"; filename="founds.txt"\r\nContent-Type: text/plain\r\n\r\n${fileContent}\r\n`;
-        payload += `--${boundary}--\r\n`;
-
-        const options = {
-            hostname: 'hashes.com',
-            path: '/en/api/founds',
-            method: 'POST',
-            headers: {
-                'Content-Type': `multipart/form-data; boundary=${boundary}`,
-                'Content-Length': Buffer.byteLength(payload),
-                'User-Agent': 'python-requests/2.28.1',
-                'Accept': '*/*',
-                'Connection': 'close'
-            }
-        };
-
-        const proxyReq = https.request(options, (proxyRes) => {
-            let data = '';
-            proxyRes.on('data', chunk => data += chunk);
-            proxyRes.on('end', () => {
-                try {
-                    const json = JSON.parse(data);
-                    res.json(json);
-                } catch(e) {
-                    res.status(proxyRes.statusCode).send(data);
-                }
-            });
-        });
-        
-        proxyReq.on('error', e => {
-            console.error("Proxy JSON Error:", e);
-            res.status(500).json({ error: e.message });
-        });
-        
-        proxyReq.write(payload);
-        proxyReq.end();
-        return;
-    }
-
-    // FALLBACK METHOD: Standard buffering for direct File/Blob uploads
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => {
-        const bodyBuffer = Buffer.concat(chunks);
-        const options = { 
-            hostname: 'hashes.com', 
-            path: '/en/api/founds', 
-            method: 'POST', 
-            headers: { 
-                'Content-Type': req.headers['content-type'],
-                'Content-Length': bodyBuffer.length, 
-                'Host': 'hashes.com',
-                'User-Agent': 'python-requests/2.28.1',
-                'Origin': 'https://hashes.com',
-                'Referer': 'https://hashes.com/',
-                'Accept': '*/*',
-                'Connection': 'close'
-            } 
-        };
-
-        const proxyReq = https.request(options, (proxyRes) => {
-            res.status(proxyRes.statusCode);
-            if(proxyRes.headers['content-type']) res.set('content-type', proxyRes.headers['content-type']);
-            proxyRes.pipe(res);
-        });
-
-        proxyReq.on('error', (e) => { 
-            console.error('Proxy Post Error:', e); 
-            res.status(500).json({ error: e.message }); 
-        });
-
-        proxyReq.write(bodyBuffer);
-        proxyReq.end();
-    });
-});
 
 app.post('/api/tools/prince', (req, res) => {
     const { source, pwMin, pwMax, elemMin, elemMax, limit, casePermute, outputName, wordlistContent } = req.body;
@@ -1488,7 +1017,6 @@ app.post('/api/session/start', async (req, res) => {
                       const parsed = parsePotfileLine(line);
                       if (parsed) {
                           io.emit('session_crack', { sessionId, hash: parsed.hash, plain: parsed.plain });
-                          pushRecentPlain(parsed.plain);
                           if (activeSessions[sessionId]) activeSessions[sessionId].stats.recoveredCount++;
                           try { fs.appendFileSync(POTFILE_PATH, line + '\n'); } catch (e) { }
                           // Sidecar so restore can replay this crack later.
@@ -1541,14 +1069,12 @@ app.post('/api/session/start', async (req, res) => {
                     const knownDevices = Object.keys(activeSessions[sessionId].stats.latestSpeeds);
                     const isAggregate = deviceId === '*' || (knownDevices.length === 1 && deviceId === '1');
                     io.emit('stats_update', { sessionId, type: 'hashrate', value: hashrate, isAggregate });
-                    if (isAggregate && hashrate > 0) setLiveStat(sessionId, 'hashrate', hashrate);
                 }
             }
             const progressRegex = /Progress.*?:\s+\d+\/\d+\s+\(([\d\.]+)%\)/i;
             const progMatch = trimmedLine.match(progressRegex);
             if (progMatch) {
                 io.emit('stats_update', { sessionId, type: 'progress', value: parseFloat(progMatch[1]) });
-                setLiveStat(sessionId, 'progressPercent', parseFloat(progMatch[1]));
                 if (activeSessions[sessionId]) {
                     const s = activeSessions[sessionId].stats;
                     const speeds = s.latestSpeeds;
@@ -1566,7 +1092,6 @@ app.post('/api/session/start', async (req, res) => {
                 const parenMatch = fullTimeStr.match(/\((.*?)\)/);
                 const value = parenMatch ? parenMatch[1] : fullTimeStr;
                 io.emit('stats_update', { sessionId, type: 'time_estimated', value: value });
-                setLiveStat(sessionId, 'timeEstimatedSec', parseHashcatTimeToSec(value));
             }
             const recoveredRegex = /Recovered.*?:\s+(\d+)\/(\d+)/i;
             const recMatch = trimmedLine.match(recoveredRegex);
@@ -1613,8 +1138,6 @@ app.post('/api/session/start', async (req, res) => {
       fs.unwatchFile(sessionPotFile);
       if (fs.existsSync(sessionPotFile)) { try { fs.unlinkSync(sessionPotFile); } catch(e) {} }
       if(activeSessions[sessionId]) delete activeSessions[sessionId];
-      delete liveStats[sessionId];
-      clearRecentPlainsIfIdle();
   };
 
   try {
@@ -1680,7 +1203,6 @@ app.post('/api/session/start', async (req, res) => {
             io.emit('session_status', { sessionId, status: 'ERROR' });
             fs.unwatchFile(sessionPotFile);
             if(activeSessions[sessionId]) delete activeSessions[sessionId];
-            delete liveStats[sessionId];
         });
     }
 
@@ -1709,7 +1231,6 @@ const parseAndEmitStats = (line, sessionId) => {
         else if (unit === 'mh/s') h *= 1000000;
         else if (unit === 'gh/s') h *= 1000000000;
         io.emit('stats_update', { sessionId, type: 'hashrate', value: h, isAggregate: speedMatch[1] === '*' });
-        if (speedMatch[1] === '*' && h > 0) setLiveStat(sessionId, 'hashrate', h);
         if (activeSessions[sessionId]) {
             const st = activeSessions[sessionId].stats;
             if (!st.latestSpeeds) st.latestSpeeds = {};
@@ -1721,7 +1242,6 @@ const parseAndEmitStats = (line, sessionId) => {
     const progMatch = line.match(/Progress.*?:\s+\d+\/\d+\s+\(([\d\.]+)%\)/i);
     if (progMatch) {
         io.emit('stats_update', { sessionId, type: 'progress', value: parseFloat(progMatch[1]) });
-        setLiveStat(sessionId, 'progressPercent', parseFloat(progMatch[1]));
         if (activeSessions[sessionId]) {
             const st = activeSessions[sessionId].stats;
             const speeds = st.latestSpeeds || {};
@@ -1737,7 +1257,6 @@ const parseAndEmitStats = (line, sessionId) => {
         const pm = timeMatch[1].match(/\((.*?)\)/);
         const value = pm ? pm[1] : timeMatch[1];
         io.emit('stats_update', { sessionId, type: 'time_estimated', value });
-        setLiveStat(sessionId, 'timeEstimatedSec', parseHashcatTimeToSec(value));
     }
     const recMatch = line.match(/Recovered.*?:\s+(\d+)\/(\d+)/i);
     if (recMatch) {
@@ -1983,10 +1502,6 @@ app.post('/api/smart-workflow/start', (req, res) => {
     } catch (e) {}
 
     const emitPhase = (phase, message, extra = {}) => {
-        // Record the current phase so /api/pebble/state (and the watch's
-        // timeline pins) can tell the dictionary phase apart from the mask
-        // phase without inspecting hashcat's per-mask live estimates.
-        if (activeWorkflows[workflowId]) activeWorkflows[workflowId].phase = phase;
         io.emit('smart_workflow_phase', { workflowId, phase, message, ...extra });
         io.emit('log', { sessionId: workflowId, level: 'INFO', message: `[Smart Phase ${phase}/4] ${message}` });
     };
@@ -2022,7 +1537,6 @@ app.post('/api/smart-workflow/start', (req, res) => {
                         const parsed = parsePotfileLine(line);
                         if (parsed) {
                             io.emit('session_crack', { sessionId: workflowId, hash: parsed.hash, plain: parsed.plain });
-                            pushRecentPlain(parsed.plain);
                             if (activeSessions[workflowId]) activeSessions[workflowId].stats.recoveredCount++;
                             try { fs.appendFileSync(POTFILE_PATH, line.trim() + '\n'); } catch(e) {}
                         }
@@ -2212,11 +1726,6 @@ app.post('/api/smart-workflow/start', (req, res) => {
                 hashrateHps: effectiveHashrateHps,
                 hashrateSource,
             });
-            // The full mask attack's estimated runtime (all patterns combined),
-            // for the watch's single "mask attack" timeline pin.
-            if (activeWorkflows[workflowId]) {
-                activeWorkflows[workflowId].maskEtaSec = assets.estimatedPhase3Seconds || 0;
-            }
             if (activeWorkflows[workflowId]?.aborted) throw new Error('__ABORTED__');
 
             // Phase 3: Targeted mask attack
@@ -2226,10 +1735,6 @@ app.post('/api/smart-workflow/start', (req, res) => {
                     ? `Targeted mask attack — ${assets.masks.length} patterns, sort: ${phase3SortMode}, est. ~${assets.estimatedPhase3Eta}`
                     : `Targeted mask attack with ${assets.masks.length} patterns (lengths ${maskMinLen || '?'}–${maskMaxLen || '?'})`;
                 emitPhase(3, p3Desc);
-                // Anchor the mask-attack pin to the real phase-3 start so the
-                // watch shows one stable "complete mask attack" finish time
-                // rather than a pin that jumps with each per-mask estimate.
-                if (activeWorkflows[workflowId]) activeWorkflows[workflowId].phase3StartTime = Date.now();
                 const phase3Args = [
                     '-m', hashType.toString(), '-a', '3',
                     '--potfile-path', sessionPotFile, '--session', `${workflowId}_p3`,
@@ -2373,9 +1878,7 @@ app.post('/api/smart-workflow/start', (req, res) => {
         } finally {
             fs.unwatchFile(sessionPotFile);
             if (activeSessions[workflowId]) delete activeSessions[workflowId];
-            delete liveStats[workflowId];
             if (activeWorkflows[workflowId]) delete activeWorkflows[workflowId];
-            clearRecentPlainsIfIdle();
             tempFiles.forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(e) {} });
         }
     })();
@@ -2433,7 +1936,6 @@ app.post('/api/session/delete', (req, res) => {
            else s.process.kill('SIGKILL');
         } catch(e) {}
         if (!s.isWorkflow) delete activeSessions[sessionId];
-        delete liveStats[sessionId];
     }
 
     // Delete session potfile and the cracks-replay sidecar (the latter survives
@@ -2670,9 +2172,6 @@ const pollGpuStats = () => {
                 gpus.push({ index, name, watts: isNaN(pwr) ? 0 : pwr, temp: isNaN(temp) ? 0 : temp });
             }
         });
-        currentGlobalPower = totalWatts;
-        currentMaxTemp = maxTemp;
-        currentGpus = gpus;
         const activeIds = Object.keys(activeSessions);
         if (activeIds.length > 0 && totalWatts > 0) {
             activeIds.forEach(id => {
@@ -2691,9 +2190,6 @@ const pollGpuStats = () => {
 setInterval(pollGpuStats, 2000);
 
 io.on('connection', (socket) => {
-  const history = getFullPotfile();
-  socket.emit('potfile_sync', history);
-  socket.emit('remote_status_update', remoteConfig);
   Object.keys(activeSessions).forEach(sessionId => {
       const s = activeSessions[sessionId];
       socket.emit('session_started', { sessionId, name: s.name });
@@ -2726,28 +2222,6 @@ app.get('/api/smart-workflow/masks/:workflowId', (req, res) => {
     const filePath = path.join(uploadDir, `${workflowId}${suffix}.hcmask`);
     if (!fs.existsSync(filePath)) return res.status(404).send('Mask file not found');
     res.download(filePath, `masks_${workflowId}_${type}.hcmask`);
-});
-
-app.get('/pebble-config', (req, res) => {
-    // Serve the Pebble Time 2 watchapp configuration page. Lives next to
-    // the backend in dev, and is bundled with the Electron extraResources
-    // in production.
-    const candidates = [
-        path.join(__dirname, '..', 'pebble-client', 'config', 'index.html'),
-        path.join(RESOURCES_PATH || '', 'pebble-client', 'config', 'index.html'),
-    ];
-    for (const p of candidates) {
-        if (p && fs.existsSync(p)) return res.sendFile(p);
-    }
-    res.status(404).send('Pebble config page not found. Build pebble-client first.');
-});
-
-app.get('*', (req, res) => {
-    if (staticPath && fs.existsSync(path.join(staticPath, 'index.html'))) {
-        res.sendFile(path.join(staticPath, 'index.html'));
-    } else {
-        res.status(404).send('Frontend build not found. Remote UI unavailable.');
-    }
 });
 
 server.listen(PORT, () => console.log(`Bridge running on ${PORT}`));

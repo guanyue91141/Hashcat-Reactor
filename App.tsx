@@ -10,18 +10,16 @@ import {
   FileKey, Workflow, ChevronDown, CheckCircle2, SkipForward, Clock
 } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
-import { SessionStats, SessionStatus, LogEntry, HistoryPoint, HashcatConfig, RecoveredHash, QueueItem, EscrowAlgo, SmartWorkflowOpts, ReactorTask } from './types';
+import { SessionStats, SessionStatus, LogEntry, HistoryPoint, HashcatConfig, RecoveredHash, QueueItem, SmartWorkflowOpts, ReactorTask } from './types';
 import { INITIAL_SESSION, DEFAULT_CONFIG, HASH_TYPES } from './constants';
 import LogTerminal from './components/LogTerminal';
 import InteractiveTerminal from './components/InteractiveTerminal';
 import CpuChart from './components/CpuChart';
 import ConfigPanel from './components/ConfigPanel';
-import EscrowDashboard, { AutoUploadSettings } from './components/EscrowDashboard';
 import RecoveredHashList from './components/RecoveredHashList';
 import TaskManager from './components/TaskManager';
-import Insights, { PastSession } from './components/Insights';
+import { PastSession } from './sessionHistory';
 import PowerGraph from './components/PowerGraph';
-import RemoteAccess from './components/RemoteAccess';
 import File2John from './components/File2John';
 import SessionControls from './components/SessionControls';
 
@@ -61,209 +59,6 @@ const getAttackModeName = (mode: number) => {
     }
 };
 
-const getCharMask = (char: string) => {
-    if (/[a-z]/.test(char)) return '?l';
-    if (/[A-Z]/.test(char)) return '?u';
-    if (/[0-9]/.test(char)) return '?d';
-    if (/\s/.test(char)) return '?b'; 
-    return '?s'; 
-};
-
-const getMaskComplexity = (mask: string) => {
-    let count = 1;
-    for (let i = 0; i < mask.length; i+=2) {
-        const char = mask.substring(i, i+2);
-        if (char === '?l') count *= 26;
-        else if (char === '?u') count *= 26;
-        else if (char === '?d') count *= 10;
-        else if (char === '?s') count *= 33;
-        else if (char === '?a') count *= 95;
-        else if (char === '?b') count *= 256;
-    }
-    return count;
-};
-
-const calculateEntropy = (password: string) => {
-    if (!password) return 0;
-    let pool = 0;
-    if (/[a-z]/.test(password)) pool += 26;
-    if (/[A-Z]/.test(password)) pool += 26;
-    if (/[0-9]/.test(password)) pool += 10;
-    if (/[^a-zA-Z0-9]/.test(password)) pool += 32; 
-    if (pool === 0) return 0;
-    return Math.log2(pool) * password.length;
-};
-
-const generateSnapshot = (hashes: RecoveredHash[], hashrate: number) => {
-    if (!hashes || hashes.length === 0) {
-        return { 
-            sortedMasks: [], lengthCounts: {}, charsets: {}, 
-            topPasswords: [], topBaseWords: [], topPrefixes: [], topSuffixes: [], 
-            yearPatterns: [], datePatterns: [], delimiters: [], leetspeak: [],
-            positionCounts: { lower: [], upper: [], digit: [], special: [] }, 
-            avgEntropy: 0, total: 0 
-        };
-    }
-
-    const maskCounts: Record<string, number> = {};
-    const lengthCounts: Record<number, number> = {};
-    const passwordFrequency: Record<string, number> = {};
-    const baseWordFrequency: Record<string, number> = {};
-    const prefixCounts: Record<string, number> = {};
-    const suffixCounts: Record<string, number> = {};
-    
-    // Semantic Counters
-    const yearCounts: Record<string, number> = {};
-    const dateCounts: Record<string, number> = {};
-    const delimiterCounts: Record<string, number> = {};
-    const subCounts: Record<string, number> = {};
-
-    // Position Analysis Arrays (Max length 16)
-    const posLower = new Array(16).fill(0);
-    const posUpper = new Array(16).fill(0);
-    const posDigit = new Array(16).fill(0);
-    const posSpecial = new Array(16).fill(0);
-
-    const charsets: Record<string, number> = {
-        'Numeric': 0, 'Lower Alpha': 0, 'Mixed Alpha': 0, 'Mixed Alpha-Num': 0, 'Full Complex': 0
-    };
-    let totalEntropy = 0;
-    let validCount = 0;
-
-    // Semantic Regex Patterns
-    const regexYMD = /\b(19|20)\d{2}([-/.:_])\d{1,2}\2\d{1,2}\b/g;
-    const regexDMY = /\b\d{1,2}([-/.:_])\d{1,2}\1(19|20)\d{2}\b/g;
-    const regexShort = /\b\d{1,2}([-/.:_])\d{1,2}\1\d{2}\b/g;
-    const regexCompactYMD = /\b(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\b/g;
-    const regexCompactShort = /\b(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{2}\b/g;
-    
-    const leetspeakMap: Record<string, string> = { 
-        '@': 'a', '4': 'a', '3': 'e', '1': 'i', '!': 'i', 
-        '0': 'o', '$': 's', '5': 's', '7': 't', '+': 't', '(': 'c' 
-    };
-
-    hashes.forEach(h => {
-        const p = h.plain;
-        if (!p) return;
-        validCount++;
-
-        const mask = p.split('').map(getCharMask).join('');
-        maskCounts[mask] = (maskCounts[mask] || 0) + 1;
-
-        // Base Word / Structure
-        const match = p.match(/^([^a-zA-Z]*)([a-zA-Z]+.*[a-zA-Z]|[a-zA-Z])([^a-zA-Z]*)$/);
-        if (match) {
-            const prefix = match[1];
-            const suffix = match[3];
-            if (prefix) prefixCounts[prefix] = (prefixCounts[prefix] || 0) + 1;
-            if (suffix) suffixCounts[suffix] = (suffixCounts[suffix] || 0) + 1;
-        }
-
-        // Base Word Extraction (Generalized)
-        const wordMatch = p.match(/[a-zA-Z]{3,}/g);
-        if (wordMatch) {
-            const longestWord = wordMatch.reduce((a, b) => a.length >= b.length ? a : b);
-            const key = longestWord.charAt(0).toUpperCase() + longestWord.slice(1).toLowerCase();
-            baseWordFrequency[key] = (baseWordFrequency[key] || 0) + 1;
-        }
-
-        // --- Position Analysis ---
-        for(let i = 0; i < Math.min(p.length, 16); i++) {
-            const char = p[i];
-            if (/[a-z]/.test(char)) posLower[i]++;
-            else if (/[A-Z]/.test(char)) posUpper[i]++;
-            else if (/[0-9]/.test(char)) posDigit[i]++;
-            else posSpecial[i]++;
-        }
-
-        // --- Date Analysis ---
-        const matchedDates: string[] = [];
-        const matches = [
-            ...Array.from(p.matchAll(regexYMD)),
-            ...Array.from(p.matchAll(regexDMY)),
-            ...Array.from(p.matchAll(regexShort)),
-            ...Array.from(p.matchAll(regexCompactYMD)),
-            ...Array.from(p.matchAll(regexCompactShort))
-        ];
-        
-        matches.forEach(m => matchedDates.push(m[0]));
-        matchedDates.forEach(d => dateCounts[d] = (dateCounts[d] || 0) + 1);
-
-        // Simple Year Fallback
-        if (matchedDates.length === 0) {
-            const years = p.match(/(?:19|20)\d{2}/g);
-            if (years) years.forEach(y => yearCounts[y] = (yearCounts[y] || 0) + 1);
-        }
-
-        // --- Delimiters ---
-        const delimiterMatch = p.match(/[a-zA-Z]([-/:.+_!@?])[0-9]/);
-        if (delimiterMatch) {
-            delimiterCounts[delimiterMatch[1]] = (delimiterCounts[delimiterMatch[1]] || 0) + 1;
-        }
-
-        // --- Leetspeak ---
-        for (const char of p) {
-            if (leetspeakMap[char]) {
-                const key = leetspeakMap[char] + ' -> ' + char;
-                subCounts[key] = (subCounts[key] || 0) + 1;
-            }
-        }
-
-        lengthCounts[p.length] = (lengthCounts[p.length] || 0) + 1;
-        passwordFrequency[p] = (passwordFrequency[p] || 0) + 1;
-        totalEntropy += calculateEntropy(p);
-
-        const hasDigit = /[0-9]/.test(p);
-        const hasLower = /[a-z]/.test(p);
-        const hasUpper = /[A-Z]/.test(p);
-        const hasSpecial = /[^a-zA-Z0-9]/.test(p);
-
-        if (hasDigit && !hasLower && !hasUpper && !hasSpecial) charsets['Numeric']++;
-        else if (!hasDigit && hasLower && !hasUpper && !hasSpecial) charsets['Lower Alpha']++;
-        else if (!hasDigit && hasLower && hasUpper && !hasSpecial) charsets['Mixed Alpha']++;
-        else if (hasDigit && (hasLower || hasUpper) && !hasSpecial) charsets['Mixed Alpha-Num']++;
-        else charsets['Full Complex']++;
-    });
-
-    const targetPps = hashrate > 0 ? hashrate : 1000000;
-
-    const sortedMasks = Object.entries(maskCounts)
-        .map(([mask, count]) => {
-            const complexity = getMaskComplexity(mask);
-            return { mask, count, complexity, timeToCrack: complexity / targetPps };
-        })
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 100); 
-
-    const topPasswords = Object.entries(passwordFrequency).sort(([, a], [, b]) => b - a).slice(0, 50) as [string, number][];
-    const topBaseWords = Object.entries(baseWordFrequency).sort(([, a], [, b]) => b - a).slice(0, 50) as [string, number][];
-    const topPrefixes = Object.entries(prefixCounts).sort(([, a], [, b]) => b - a).slice(0, 20) as [string, number][];
-    const topSuffixes = Object.entries(suffixCounts).sort(([, a], [, b]) => b - a).slice(0, 20) as [string, number][];
-    
-    // Process new lists
-    const yearPatterns = Object.entries(yearCounts).sort(([, a], [, b]) => b - a).slice(0, 15) as [string, number][];
-    const datePatterns = Object.entries(dateCounts).sort(([, a], [, b]) => b - a).slice(0, 15) as [string, number][];
-    const delimiters = Object.entries(delimiterCounts).sort(([, a], [, b]) => b - a).slice(0, 10) as [string, number][];
-    const leetspeak = Object.entries(subCounts).sort(([, a], [, b]) => b - a).slice(0, 15) as [string, number][];
-
-    return {
-        sortedMasks,
-        lengthCounts,
-        charsets,
-        topPasswords,
-        topBaseWords,
-        topPrefixes,
-        topSuffixes,
-        yearPatterns,
-        datePatterns,
-        delimiters,
-        leetspeak,
-        positionCounts: { lower: posLower, upper: posUpper, digit: posDigit, special: posSpecial }, 
-        avgEntropy: validCount > 0 ? totalEntropy / validCount : 0,
-        total: validCount
-    };
-};
-
 // --- HELPER: FORMAT HASHRATE DYNAMICALLY ---
 const formatHashrate = (rate: number) => {
     if (rate === 0) return '0 H/s';
@@ -273,63 +68,15 @@ const formatHashrate = (rate: number) => {
     return `${rate.toFixed(0)} H/s`;
 };
 
-const getSocketUrl = () => {
-    const host = window.location.hostname;
-    if (host.includes('zrok.io') || window.location.port === '3001') {
-        return window.location.origin;
-    }
-    return 'http://localhost:3001';
-};
+const getSocketUrl = () => 'http://localhost:3001';
 
 function App() {
-  const { t, i18n } = useTranslation(); 
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'insights' | 'terminal' | 'escrow' | 'config' | 'queue' | 'remote' | 'file2john'>('dashboard');
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('hashes_apikey') || '');
-  
-  const isRemoteSession = useMemo(() => window.location.hostname.includes('zrok.io') || !window.process, []);
-
-  useEffect(() => {
-    if (isRemoteSession && (activeTab === 'terminal' || activeTab === 'remote')) {
-        setActiveTab('dashboard');
-    }
-  }, [activeTab, isRemoteSession]);
-
+  const { t, i18n } = useTranslation();
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'terminal' | 'config' | 'queue' | 'file2john'>('dashboard');
   const [config, setConfig] = useState<HashcatConfig>(() => {
       const saved = localStorage.getItem('reactor_config');
       return saved ? JSON.parse(saved) : DEFAULT_CONFIG;
   });
-
-  const [autoUploadSettings, setAutoUploadSettings] = useState<AutoUploadSettings>(() => {
-      const saved = localStorage.getItem('reactor_auto_upload');
-      return saved ? JSON.parse(saved) : { enabled: false, threshold: 10 };
-  });
-
-  const [escrowAlgorithms, setEscrowAlgorithms] = useState<EscrowAlgo[]>([]);
-
-  useEffect(() => {
-      localStorage.setItem('reactor_auto_upload', JSON.stringify(autoUploadSettings));
-  }, [autoUploadSettings]);
-
-  useEffect(() => {
-    const fetchAlgos = async () => {
-        try {
-            const proxyUrl = getSocketUrl() + '/api/escrow/proxy?url=' + encodeURIComponent('https://hashes.com/en/api/algorithms');
-            const response = await fetch(proxyUrl);
-            const data = await response.json();
-            
-            if (Array.isArray(data)) {
-                setEscrowAlgorithms(data);
-            } else if (data.list && Array.isArray(data.list)) {
-                setEscrowAlgorithms(data.list);
-            } else if (data.success && Array.isArray(data.list)) {
-                setEscrowAlgorithms(data.list);
-            }
-        } catch (e) {
-            console.error("Failed to load escrow algorithms", e);
-        }
-    };
-    fetchAlgos();
-  }, []);
 
   const [backendConnected, setBackendConnected] = useState(false);
   const socketRef = useRef<Socket | null>(null);
@@ -346,8 +93,7 @@ function App() {
   const sessionsRef = useRef(sessions);
   const [sessionLogs, setSessionLogs] = useState<Record<string, LogEntry[]>>(readSavedSessionLogs);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  
-  const [globalPotfile, setGlobalPotfile] = useState<RecoveredHash[]>([]);
+
   const [jobQueue, setJobQueue] = useState<QueueItem[]>([]);
   const [tasks, setTasks] = useState<ReactorTask[]>([]);
   const tasksRef = useRef(tasks);
@@ -359,11 +105,11 @@ function App() {
     if (activeSessionId && sessions[activeSessionId]) {
         return sessions[activeSessionId];
     }
-    return { 
-      ...INITIAL_SESSION, 
-      hashType: config.hashType, 
-      recoveredHashes: [] 
-    }; 
+    return {
+      ...INITIAL_SESSION,
+      hashType: config.hashType,
+      recoveredHashes: []
+    };
   }, [activeSessionId, sessions, config.hashType]);
 
   const logs = useMemo(() => {
@@ -374,14 +120,14 @@ function App() {
   const status = session.status;
   const isSessionTargetLocked = status === SessionStatus.RUNNING || status === SessionStatus.PAUSED;
   const [history, setHistory] = useState<HistoryPoint[]>([]);
-  
-  const [escrowSubmissionData, setEscrowSubmissionData] = useState<string>('');
-  const [escrowSubmissionAlgo, setEscrowSubmissionAlgo] = useState<string>('');
-  
+
+
   const [manualTargetInput, setManualTargetInput] = useState('');
   const [manualTargetFile, setManualTargetFile] = useState<File | null>(null);
-  
+
   const [isStarting, setIsStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const [rerunTask, setRerunTask] = useState<ReactorTask | null>(null);
   const isStartingRef = useRef(isStarting);
   const sessionRunningRef = useRef(false);
   // Last raw status reported per session (RUNNING/COMPLETED/STOPPED/ERROR…).
@@ -391,7 +137,7 @@ function App() {
   const sessionFinalStatusRef = useRef<Record<string, string>>({});
 
   const [pastSessions, setPastSessions] = useState<PastSession[]>([]);
-  
+
   const sessionStartTimes = useRef<Record<string, number>>({});
   const runningConfigs = useRef<Record<string, HashcatConfig>>({});
 
@@ -407,16 +153,6 @@ function App() {
   const smartWorkflowStateRef = useRef<SmartWorkflowState | null>(null);
   const [swHeaderOpen, setSwHeaderOpen] = useState(false);
   const swHeaderRef = useRef<HTMLDivElement>(null);
-
-  const uploadingSessionIds = useRef<Set<string>>(new Set());
-
-  const autoUploadSettingsRef = useRef(autoUploadSettings);
-  const apiKeyRef = useRef(apiKey);
-  const escrowAlgorithmsRef = useRef(escrowAlgorithms);
-
-  useEffect(() => { autoUploadSettingsRef.current = autoUploadSettings; }, [autoUploadSettings]);
-  useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
-  useEffect(() => { escrowAlgorithmsRef.current = escrowAlgorithms; }, [escrowAlgorithms]);
 
   useEffect(() => {
       isStartingRef.current = isStarting;
@@ -493,200 +229,6 @@ function App() {
       return activeSessionId ? (session.recoveredHashes || []) : [];
   }, [activeSessionId, session.recoveredHashes]);
 
-  const newHashesCount = useMemo(() => currentDisplayedCracks.filter(h => !h.sentToEscrow).length, [currentDisplayedCracks]);
-
-  // --- INTELLIGENT MULTI-SESSION AUTO UPLOAD ---
-  useEffect(() => {
-    // Only set up the interval if API key is present and auto-upload is enabled
-    if (!apiKey || !autoUploadSettings.enabled) return;
-
-    const checkAndUploadAll = async () => {
-        const currentSessions = sessionsRef.current;
-        const sessionKeys = Object.keys(currentSessions);
-
-        for (const sessId of sessionKeys) {
-            if (uploadingSessionIds.current.has(sessId)) continue;
-
-            const sess = currentSessions[sessId];
-            if (!sess || !sess.recoveredHashes) continue;
-
-            const unsentHashes = sess.recoveredHashes.filter(h => !h.sentToEscrow);
-            const threshold = Number(autoUploadSettings.threshold) || 10;
-            
-            // Check threshold logic
-            if (unsentHashes.length >= threshold) {
-                uploadingSessionIds.current.add(sessId);
-                
-                // Algo Detection Logic - Default strictly to the hashcat mode ID
-                let targetAlgoId = sess.hashType;
-                
-                // If it's not a number (e.g. they typed a string), attempt to parse from known types
-                if (!targetAlgoId || isNaN(Number(targetAlgoId))) {
-                    const hashTypeObj = HASH_TYPES?.find(ht => ht.id === sess.hashType);
-                    if (hashTypeObj && escrowAlgorithms.length > 0) {
-                         const normalize = (s: string) => s?.toLowerCase().replace(/[^a-z0-9]/g, '');
-                         const sessionAlgoName = normalize(hashTypeObj.name.split(' ')[0]);
-                         const matchedAlgo = escrowAlgorithms.find(ea => normalize(ea.algorithmName) === sessionAlgoName);
-                         if (matchedAlgo) targetAlgoId = matchedAlgo.id.toString();
-                    }
-                }
-
-                if (!targetAlgoId || isNaN(Number(targetAlgoId))) {
-                    addLog(sessId, `[AUTO-UPLOAD] Skipped: Target algorithm ID "${sess.hashType}" is invalid or unknown.`, 'WARN');
-                    uploadingSessionIds.current.delete(sessId);
-                    continue;
-                }
-
-                addLog(sessId, `[AUTO-UPLOAD] Threshold reached (${unsentHashes.length}/${threshold}). Sending to Algo ID ${targetAlgoId}...`, 'INFO');
-
-                try {
-                    const content = unsentHashes.map(h => `${h.hash}:${h.plain}`).join('\n');
-                    const apiUrl = getSocketUrl() + '/api/escrow/proxy';
-                    
-                    const response = await fetch(apiUrl, { 
-                        method: 'POST', 
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            key: apiKey,
-                            algo: targetAlgoId,
-                            fileContent: content
-                        })
-                    });
-                    
-                    const res = await response.json();
-
-                    if (res.success === true) {
-                        addLog(sessId, `[AUTO-UPLOAD] Success! Uploaded ${unsentHashes.length} hashes.`, 'SUCCESS');
-                        
-                        // Mark these specific hashes as sent
-                        setSessions(prev => {
-                            const existingSess = prev[sessId];
-                            if (!existingSess) return prev;
-                            return {
-                                ...prev,
-                                [sessId]: {
-                                    ...existingSess,
-                                    recoveredHashes: existingSess.recoveredHashes.map(h => 
-                                        unsentHashes.some(uh => uh.id === h.id) ? { ...h, sentToEscrow: true } : h
-                                    )
-                                }
-                            };
-                        });
-                    } else {
-                        addLog(sessId, `[AUTO-UPLOAD] Failed: ${res.message || 'Unknown API error'}`, 'WARN');
-                    }
-                } catch (e: any) {
-                    addLog(sessId, `[AUTO-UPLOAD] Proxy Error: ${e.message}`, 'ERROR');
-                } finally {
-                    setTimeout(() => { uploadingSessionIds.current.delete(sessId); }, 2000);
-                }
-            }
-        }
-    };
-
-    const interval = setInterval(checkAndUploadAll, 8000);
-    return () => clearInterval(interval);
-
-  }, [autoUploadSettings.enabled, autoUploadSettings.threshold, apiKey, escrowAlgorithms]);
-
-  // --- SESSION-END FLUSH: Upload remaining unsent hashes when a session finishes ---
-  const flushSessionHashes = async (sessionId: string) => {
-    const settings = autoUploadSettingsRef.current;
-    const key = apiKeyRef.current;
-    if (!settings.enabled || !key) return;
-
-    const currentSessions = sessionsRef.current;
-    const sess = currentSessions[sessionId];
-    if (!sess || !sess.recoveredHashes) return;
-
-    const unsentHashes = sess.recoveredHashes.filter(h => !h.sentToEscrow);
-    if (unsentHashes.length === 0) return;
-
-    // Skip if already being uploaded by the interval
-    if (uploadingSessionIds.current.has(sessionId)) {
-      // Wait for the interval upload to finish, then re-check for leftovers
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      const recheckSess = sessionsRef.current[sessionId];
-      if (!recheckSess) return;
-      const stillUnsent = recheckSess.recoveredHashes.filter(h => !h.sentToEscrow);
-      if (stillUnsent.length === 0) return;
-      // Fall through to flush the remaining
-    }
-
-    uploadingSessionIds.current.add(sessionId);
-
-    // Resolve the algo ID (same logic as the interval auto-upload)
-    let targetAlgoId = sess.hashType;
-    if (!targetAlgoId || isNaN(Number(targetAlgoId))) {
-      const hashTypeObj = HASH_TYPES?.find(ht => ht.id === sess.hashType);
-      if (hashTypeObj && escrowAlgorithmsRef.current.length > 0) {
-        const normalize = (s: string) => s?.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const sessionAlgoName = normalize(hashTypeObj.name.split(' ')[0]);
-        const matchedAlgo = escrowAlgorithmsRef.current.find(ea => normalize(ea.algorithmName) === sessionAlgoName);
-        if (matchedAlgo) targetAlgoId = matchedAlgo.id.toString();
-      }
-    }
-
-    if (!targetAlgoId || isNaN(Number(targetAlgoId))) {
-      addLog(sessionId, `[SESSION-END FLUSH] Skipped: Cannot resolve algorithm ID for "${sess.hashType}".`, 'WARN');
-      uploadingSessionIds.current.delete(sessionId);
-      return;
-    }
-
-    // Re-fetch unsent in case interval uploaded some while we resolved the algo
-    const finalSess = sessionsRef.current[sessionId];
-    const finalUnsent = finalSess ? finalSess.recoveredHashes.filter(h => !h.sentToEscrow) : [];
-    if (finalUnsent.length === 0) {
-      uploadingSessionIds.current.delete(sessionId);
-      return;
-    }
-
-    addLog(sessionId, `[SESSION-END FLUSH] Session ended with ${finalUnsent.length} unsent hashes (below threshold of ${settings.threshold}). Flushing...`, 'INFO');
-
-    try {
-      const content = finalUnsent.map(h => `${h.hash}:${h.plain}`).join('\n');
-      const apiUrl = getSocketUrl() + '/api/escrow/proxy';
-
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          key,
-          algo: targetAlgoId,
-          fileContent: content
-        })
-      });
-
-      const res = await response.json();
-
-      if (res.success === true) {
-        addLog(sessionId, `[SESSION-END FLUSH] Success! Uploaded ${finalUnsent.length} remaining hashes.`, 'SUCCESS');
-        setSessions(prev => {
-          const existingSess = prev[sessionId];
-          if (!existingSess) return prev;
-          return {
-            ...prev,
-            [sessionId]: {
-              ...existingSess,
-              recoveredHashes: existingSess.recoveredHashes.map(h =>
-                finalUnsent.some(uh => uh.id === h.id) ? { ...h, sentToEscrow: true } : h
-              )
-            }
-          };
-        });
-      } else {
-        addLog(sessionId, `[SESSION-END FLUSH] Failed: ${res.message || 'Unknown API error'}`, 'WARN');
-      }
-    } catch (e: any) {
-      addLog(sessionId, `[SESSION-END FLUSH] Error: ${e.message}`, 'ERROR');
-    } finally {
-      uploadingSessionIds.current.delete(sessionId);
-    }
-  };
-
-
   useEffect(() => {
       if (activeSessionId) {
           setManualTargetInput('');
@@ -705,23 +247,22 @@ function App() {
             }
         } catch (e) { console.error("Failed to load history", e); }
     };
-    if (activeTab === 'insights' || pastSessions.length === 0) fetchHistory();
-  }, [activeTab]);
+    fetchHistory();
+  }, []);
 
-  useEffect(() => { localStorage.setItem('hashes_apikey', apiKey); }, [apiKey]);
 
   useEffect(() => { localStorage.setItem('reactor_config', JSON.stringify(config)); }, [config]);
 
-  // --- QUEUE PROCESSOR EFFECT ---  
+  // --- QUEUE PROCESSOR EFFECT ---
   useEffect(() => {
       const processQueue = async () => {
           if (!backendConnected || !isQueueProcessing || jobQueue.length === 0 || isStarting) return;
           if (sessionRunningRef.current) return;
 
-          const anyRunning = Object.values(sessions).some(s => 
+          const anyRunning = Object.values(sessions).some(s =>
             s.status === SessionStatus.RUNNING || s.status === SessionStatus.PAUSED
           );
-          
+
           if (anyRunning) { sessionRunningRef.current = true; return; }
 
           sessionRunningRef.current = true;
@@ -848,34 +389,30 @@ function App() {
   useEffect(() => {
     try {
       const socket = io(getSocketUrl(), { reconnection: true });
-      socket.on('connect', () => { 
-          setBackendConnected(true); 
-          addLog('general', '[SYSTEM] Connected to Backend.', 'SUCCESS'); 
+      socket.on('connect', () => {
+          setBackendConnected(true);
+          addLog('general', '[SYSTEM] Connected to Backend.', 'SUCCESS');
       });
-      socket.on('disconnect', () => { 
-          setBackendConnected(false); 
-          addLog('general', '[SYSTEM] Disconnected from Backend.', 'ERROR'); 
+      socket.on('disconnect', () => {
+          setBackendConnected(false);
+          addLog('general', '[SYSTEM] Disconnected from Backend.', 'ERROR');
       });
       socket.on('log', (data: { sessionId?: string, level: string, message: string }) => {
           const sid = data.sessionId || 'general';
           addLog(sid, data.message, data.level as LogEntry['level']);
-      });
-      socket.on('potfile_sync', (data: RecoveredHash[]) => {
-          setGlobalPotfile(data);
-          addLog('general', `[SYSTEM] Loaded ${data.length} historical hashes.`, 'INFO');
       });
       socket.on('session_started', ({ sessionId, taskId, name, target, recoveredHashes, hashType, attackMode }: any) => {
           sessionRunningRef.current = true;
           setSessions(prev => {
               const existing = prev[sessionId];
               const realHashType = hashType || (existing ? existing.hashType : INITIAL_SESSION.hashType);
-              
+
               return {
                 ...prev,
-                [sessionId]: { 
-                    ...INITIAL_SESSION, 
+                [sessionId]: {
+                    ...INITIAL_SESSION,
                     ...existing,
-                    sessionId, 
+                    sessionId,
                     name,
                     target,
                     hashType: realHashType,
@@ -948,7 +485,6 @@ function App() {
             exitCode: typeof data.code === 'number' ? data.code : undefined,
           });
           saveSessionHistory(data.sessionId, data.duration, data.recovered, data.total, data.avgHashrate, data.avgPower);
-          flushSessionHashes(data.sessionId);
       });
       socket.on('session_deleted', (data: { sessionId: string }) => {
           sessionRunningRef.current = false;
@@ -1016,7 +552,7 @@ function App() {
       socket.on('session_crack', (data: any) => {
           setSessions(prev => {
               const sess = prev[data.sessionId];
-              if (!sess) return prev; 
+              if (!sess) return prev;
               if (sess.recoveredHashes.some(h => h.hash === data.hash)) return prev;
               const newCrack: RecoveredHash = {
                   id: uuid(),
@@ -1024,19 +560,14 @@ function App() {
                   plain: data.plain,
                   algorithmId: sess.hashType,
                   timestamp: Date.now(),
-                  sentToEscrow: false
               };
               return { ...prev, [data.sessionId]: { ...sess, recoveredHashes: [newCrack, ...sess.recoveredHashes] } };
-          });
-          setGlobalPotfile(prev => {
-             if (prev.some(h => h.hash === data.hash)) return prev;
-             return [{ id: uuid(), hash: data.hash, plain: data.plain, algorithmId: '0', timestamp: Date.now(), sentToEscrow: false }, ...prev];
           });
       });
       socketRef.current = socket;
       return () => { socket.disconnect(); };
     } catch (e) { console.warn("Socket connection failed", e); }
-  }, []); 
+  }, []);
 
   const updateSession = (sessionId: string, updates: Partial<SessionStats>) => {
       setSessions(prev => {
@@ -1150,9 +681,6 @@ function App() {
           }))
           : undefined;
 
-      // Generate actual snapshot data
-      const analysisSnapshot = generateSnapshot(recoveredHashes, avgHashrate);
-
       // Use recovered hashes count from session if backend reported 0
       const finalRecovered = recovered > 0 ? recovered : recoveredHashes.length;
 
@@ -1168,17 +696,16 @@ function App() {
           totalHashes: total,
           avgHashrate: avgHashrate || 0,
           powerUsage: avgPower || 0,
-          analysis: analysisSnapshot,
           phaseBreakdown,
           maskFileId: isWorkflow && swState?.workflowId === sessionId ? swState.maskFileId : undefined,
           usedMasks: isWorkflow && swState?.workflowId === sessionId ? swState.usedMasks : undefined,
           skippedMasks: isWorkflow && swState?.workflowId === sessionId ? swState.skippedMasks : undefined,
           sessionId: sessionId,
       };
-      
+
       delete runningConfigs.current[sessionId];
       delete sessionStartTimes.current[sessionId];
-      
+
       setPastSessions(prev => [pastSession, ...prev]);
       fetch(getSocketUrl() + '/api/history/sessions', {
           method: 'POST',
@@ -1211,7 +738,7 @@ function App() {
     const file = e.target.files?.[0];
     if (file) {
       setManualTargetFile(file);
-      setManualTargetInput(''); 
+      setManualTargetInput('');
     }
     // RESET INPUT VALUE TO ALLOW RE-SELECTION OF SAME FILE
     e.target.value = '';
@@ -1226,20 +753,20 @@ function App() {
   const prepareTarget = async (): Promise<string> => {
       if (manualTargetFile) {
           if ((manualTargetFile as any).path) return (manualTargetFile as any).path;
-          addLog('general', `[REMOTE] Auto-uploading target file...`, 'INFO');
+          addLog('general', `[TARGET] Uploading target file...`, 'INFO');
           try {
               const formData = new FormData();
               formData.append('file', manualTargetFile);
               const res = await fetch(getSocketUrl() + '/api/upload', { method: 'POST', body: formData });
               if (!res.ok) throw new Error("Upload failed");
               const data = await res.json();
-              addLog('general', `[REMOTE] Target uploaded to: ${data.path}`, 'SUCCESS');
+              addLog('general', `[TARGET] Target uploaded to: ${data.path}`, 'SUCCESS');
               return data.path;
           } catch (e: any) {
-              addLog('general', `[REMOTE] Target Upload Failed: ${e.message}`, 'ERROR');
-              return '';
+              addLog('general', `[TARGET] Target upload failed: ${e.message}`, 'ERROR');
+              throw e;
           }
-      } 
+      }
       else if (manualTargetInput) {
           const res = await fetch(getSocketUrl() + '/api/target', {
               method: 'POST',
@@ -1247,6 +774,7 @@ function App() {
               body: JSON.stringify({ content: manualTargetInput })
           });
           const data = await res.json();
+          if (!res.ok || !data.path) throw new Error(data.message || 'Could not save target.');
           return data.path;
       }
       return '';
@@ -1300,13 +828,16 @@ function App() {
   };
 
   const handleStartTask = async (customCommand?: string) => {
-    if (!backendConnected) { addLog('general', 'Backend disconnected.', 'ERROR'); return; }
+    if (isStartingRef.current) return;
+    setStartError(null);
+    if (!backendConnected) { setStartError(t('start_offline')); return; }
+    isStartingRef.current = true;
     setIsStarting(true);
     sessionRunningRef.current = true;
     let pendingTaskId: string | null = null;
     try {
       const target = await resolveTaskTarget();
-      if (!target && !customCommand) throw new Error('No target selected.');
+      if (!target && !customCommand) throw new Error(t('start_no_target'));
       const taskId = `task_${Date.now()}_${uuid()}`;
       const taskConfig = { ...config, targetPath: target?.targetPath || config.targetPath || '' };
       const task = await persistNewTask({
@@ -1315,13 +846,13 @@ function App() {
         recovered: 0, customCommand: customCommand || undefined,
       });
       pendingTaskId = task.id;
-      clearDraftTarget();
       const response = await fetch(`${getSocketUrl()}/api/session/start`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(customCommand ? { customCommand, taskId: task.id } : { ...taskConfig, taskId: task.id }),
       });
       const data = await response.json();
       if (!response.ok || !data.sessionId) throw new Error(data.message || 'Hashcat did not start.');
+      clearDraftTarget();
       runningConfigs.current[data.sessionId] = taskConfig;
       await updateTask(task.id, { status: 'RUNNING', sessionId: data.sessionId });
       updateSession(data.sessionId, { hashType: taskConfig.hashType });
@@ -1331,9 +862,10 @@ function App() {
       setSmartPhase(null);
     } catch (e: any) {
       sessionRunningRef.current = false;
+      setStartError(e.message || String(e));
       addLog('general', `Start Error: ${e.message}`, 'ERROR');
       if (pendingTaskId) void updateTask(pendingTaskId, { status: 'FAILED', endedAt: Date.now(), failureReason: e.message || String(e) });
-    } finally { setIsStarting(false); }
+    } finally { isStartingRef.current = false; setIsStarting(false); }
   };
 
   const handleResumeTask = async (task: ReactorTask) => {
@@ -1487,34 +1019,30 @@ function App() {
   };
 
   const handleStartSmartWorkflow = async (opts: SmartWorkflowOpts) => {
-    if (!backendConnected) { addLog('general', 'Smart Workflow: Backend disconnected.', 'ERROR'); return; }
+    if (isStartingRef.current) return;
+    setStartError(null);
+    if (!backendConnected) { setStartError(t('start_offline')); return; }
 
+    isStartingRef.current = true;
     setIsStarting(true);
     sessionRunningRef.current = true;
     setSmartWorkflowState(null);
-    setActiveTab('dashboard');
     let pendingTaskId: string | null = null;
 
     try {
-      let targetPath = await prepareTarget();
-      if (!targetPath) {
-        addLog('general', 'Smart Workflow aborted: No target file selected.', 'ERROR');
-        sessionRunningRef.current = false;
-        setIsStarting(false);
-        return;
-      }
+      const target = await resolveTaskTarget();
+      if (!target) throw new Error(t('start_no_target'));
+      const targetPath = target.targetPath;
 
       const workflowTaskId = `task_${Date.now()}_${uuid()}`;
       const payload = { ...buildWorkflowPayload(targetPath, opts), taskId: workflowTaskId };
       const taskConfig = { ...config, targetPath };
       const task = await persistNewTask({
         id: workflowTaskId, targetPath,
-        targetSummary: manualTargetFile?.name || targetPath.split(/[\\/]/).pop() || targetPath,
+        targetSummary: target.targetSummary,
         config: taskConfig, workflowOpts: opts, status: 'QUEUED', createdAt: Date.now(), recovered: 0,
       });
       pendingTaskId = task.id;
-      clearDraftTarget();
-
       const res = await fetch(getSocketUrl() + '/api/smart-workflow/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1523,18 +1051,22 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.message || 'Smart workflow could not start.');
       if (data.workflowId) {
+        clearDraftTarget();
         runningConfigs.current[data.workflowId] = config;
         await updateTask(task.id, { status: 'RUNNING', sessionId: data.workflowId });
         updateSession(data.workflowId, { hashType: config.hashType });
         setActiveSessionId(data.workflowId);
+        setActiveTab('dashboard');
       } else {
         throw new Error(data.message || 'Smart workflow did not return a session id.');
       }
     } catch (e: any) {
+      setStartError(e.message || String(e));
       addLog('general', `Smart Workflow Error: ${e.message}`, 'ERROR');
       if (pendingTaskId) void updateTask(pendingTaskId, { status: 'FAILED', endedAt: Date.now(), failureReason: e.message || String(e) });
       sessionRunningRef.current = false;
     } finally {
+      isStartingRef.current = false;
       setIsStarting(false);
     }
   };
@@ -1581,8 +1113,8 @@ function App() {
   // --- MANUAL START ---
   const toggleSession = async () => {
     if (activeSessionId && (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PAUSED)) {
-      await fetch(getSocketUrl() + '/api/session/stop', { 
-          method: 'POST', 
+      await fetch(getSocketUrl() + '/api/session/stop', {
+          method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId: activeSessionId })
       });
@@ -1590,19 +1122,6 @@ function App() {
       if (!backendConnected) addLog('general', 'Backend disconnected.', 'ERROR');
       else setActiveTab('config');
     }
-  };
-
-  const handleSendToEscrow = (hashes: RecoveredHash[]) => {
-      const newHashes = hashes.filter(h => !h.sentToEscrow);
-      if (newHashes.length === 0) { addLog("general", "No new hashes to send to escrow.", "WARN"); return; }
-      const content = newHashes.map(h => `${h.hash}:${h.plain}`).join('\n');
-      setEscrowSubmissionData(content);
-      setEscrowSubmissionAlgo(activeSessionId ? session.hashType : config.hashType); 
-      if (activeSessionId) {
-          setSessions(prev => ({ ...prev, [activeSessionId]: { ...prev[activeSessionId], recoveredHashes: prev[activeSessionId].recoveredHashes.map(h => newHashes.some(nh => nh.id === h.id) ? { ...h, sentToEscrow: true } : h) } }));
-      }
-      setActiveTab('escrow');
-      addLog("general", `Prepared ${newHashes.length} new hashes for escrow.`, 'INFO');
   };
 
   const handleExportSessionCracks = () => {
@@ -1644,7 +1163,7 @@ function App() {
         setPreCrackedResults({ total: data.totalTarget, found: data.foundCount, list: data.preview, downloadToken: data.downloadToken } as any);
         setShowPreCrackedModal(true);
         addLog("general", `Analysis complete: ${data.foundCount} / ${data.totalTarget} hashes found.`, 'SUCCESS');
-    } catch (e) { addLog("general", "Failed to check potfile.", "ERROR"); } 
+    } catch (e) { addLog("general", "Failed to check potfile.", "ERROR"); }
     finally { setIsCheckingPotfile(false); }
   };
 
@@ -1666,15 +1185,13 @@ function App() {
           <div className="w-8 h-8 bg-indigo-600 rounded flex items-center justify-center"><Hash className="text-white" size={20} /></div>
           <span className="ml-3 font-bold text-lg hidden lg:block">{t('app_title')}</span>
         </div>
-        
+
         <nav className="flex-1 overflow-y-auto no-scrollbar flex flex-col">
             <div className="p-4 flex-1">
                 <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'dashboard' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}><LayoutDashboard size={20} /><span className="ml-3 hidden lg:block font-medium">{t('nav_dashboard')}</span></button>
                 <button onClick={() => setActiveTab('queue')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'queue' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}>
                     <List size={20} /><div className="ml-3 hidden lg:flex items-center justify-between flex-1 font-medium"><span>{t('task_list_title')}</span>{tasks.length > 0 && <span className="bg-indigo-600 text-white text-[10px] px-1.5 py-0.5 rounded-full">{tasks.length}</span>}</div>
                 </button>
-                <button onClick={() => setActiveTab('insights')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'insights' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}><Microscope size={20} /><span className="ml-3 hidden lg:block font-medium">{t('nav_insights')}</span></button>
-                <button onClick={() => setActiveTab('escrow')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'escrow' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}><Globe size={20} /><span className="ml-3 hidden lg:block font-medium">{t('nav_escrow')}</span></button>
 
 {/* File2John Tab Button with i18n */}
                 <button onClick={() => setActiveTab('file2john')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'file2john' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}>
@@ -1683,21 +1200,13 @@ function App() {
                 </button>
 
                 <button onClick={() => setActiveTab('config')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'config' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}><Settings size={20} /><span className="ml-3 hidden lg:block font-medium">{t('nav_config')}</span></button>
-             
-                {!isRemoteSession && (
-                   <>
-                     <button onClick={() => setActiveTab('remote')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'remote' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}>
-                        <Share2 size={20} />
-                        <span className="ml-3 hidden lg:block font-medium">{t('nav_remote')}</span> 
-                     </button>
+
                      <button onClick={() => setActiveTab('terminal')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'terminal' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}>
                         <Terminal size={20} />
                         <span className="ml-3 hidden lg:block font-medium">{t('nav_terminal')}</span>
                      </button>
-                    </>
-                )}
             </div>
-            
+
             <div className="px-4 pb-4 hidden lg:block space-y-4 shrink-0 bg-slate-950 border-t border-slate-800 pt-4">
                 <div className="flex items-center gap-2 text-xs text-slate-500 mb-2">{backendConnected ? <Link size={14} className="text-emerald-500" /> : <Unlink size={14} className="text-red-500" />}<span>{backendConnected ? t('bridge_connected') : t('bridge_offline')}</span></div>
                 <PowerGraph socket={socketRef.current} compact={true} />
@@ -1871,9 +1380,9 @@ function App() {
             })()}
 
             {/* Session Controls */}
-            <SessionControls 
-                sessionId={activeSessionId} 
-                status={status} 
+            <SessionControls
+                sessionId={activeSessionId}
+                status={status}
                 onOptimisticUpdate={(newStatus) => {
                     if (activeSessionId) {
                         updateSession(activeSessionId, { status: newStatus });
@@ -1891,9 +1400,9 @@ function App() {
 
         <div className="flex-1 overflow-y-auto p-6 scroll-smooth">
           <div className="max-w-8xl mx-auto space-y-6 h-full">
-            
-            {/* ... (Dashboard, Insights, Escrow Tabs logic) ... */}
-            
+
+
+
             {activeTab === 'dashboard' && (
               <>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1928,7 +1437,6 @@ function App() {
                     <div className="flex flex-col relative h-full bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden">
                         <div className="absolute top-3 right-4 z-50 flex items-center gap-2">
                              <button onClick={handleExportSessionCracks} disabled={currentDisplayedCracks.length === 0} className="flex items-center gap-2 text-xs h-8 px-3 rounded transition-colors border font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700 disabled:opacity-50"><FileDown size={14} /> {t('btn_export')}</button>
-                             <button onClick={() => handleSendToEscrow(currentDisplayedCracks)} disabled={newHashesCount === 0} className={`flex items-center gap-2 text-xs h-8 px-3 rounded transition-colors border font-medium shadow-sm ${newHashesCount > 0 ? 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500' : 'bg-slate-800 text-slate-500 border-slate-700 cursor-not-allowed opacity-50'}`}><Globe size={14} /> {newHashesCount > 0 ? t('btn_send_new') : t('btn_all_sent')}</button>
                         </div>
                         <div className="flex-1 overflow-y-auto"><RecoveredHashList hashes={currentDisplayedCracks} /></div>
                     </div>
@@ -1945,86 +1453,16 @@ function App() {
                           <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
                               {preCrackedResults.found === 0 ? (<div className="text-center text-slate-500 py-10 italic">{t('modal_no_matches')}</div>) : (<table className="w-full text-left text-sm"><thead className="text-xs text-slate-500 uppercase bg-slate-900 sticky top-0"><tr><th className="p-2">Hash</th><th className="p-2">Plaintext</th></tr></thead><tbody className="divide-y divide-slate-800">{preCrackedResults.list.map((item, idx) => (<tr key={idx} className="hover:bg-slate-800/50"><td className="p-2 font-mono text-slate-400 truncate max-w-[200px]" title={item.hash}>{item.hash}</td><td className="p-2 font-mono text-emerald-300 truncate max-w-[200px]">{item.plain}</td></tr>))}</tbody></table>)}
                           </div>
-                          <div className="p-4 border-t border-slate-800 bg-slate-950/50 flex justify-end gap-2 shrink-0"><button onClick={() => {
-                              if (!preCrackedResults || preCrackedResults.found === 0) return;
-                              const content = preCrackedResults.list.map((h: any) => `${h.hash}:${h.plain}`).join('\n');
-                              setEscrowSubmissionData(content);
-                              setEscrowSubmissionAlgo(config.hashType);
-                              setShowPreCrackedModal(false);
-                              setActiveTab('escrow');
-                              addLog('general', `Prepared ${preCrackedResults.found} potfile cracks for escrow.`, 'INFO');
-                          }} disabled={preCrackedResults.found === 0} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"><Globe size={14} /> Send to Escrow</button><button onClick={() => { if (preCrackedResults && (preCrackedResults as any).downloadToken) window.location.href = `http://localhost:3001/api/download/check-result/${(preCrackedResults as any).downloadToken}`; }} disabled={preCrackedResults.found === 0} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold transition-colors disabled:opacity-50 flex items-center gap-2"><Download size={14} /> {t('modal_download')}</button><button onClick={() => setShowPreCrackedModal(false)} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold transition-colors">{t('modal_close')}</button></div>
+                          <div className="p-4 border-t border-slate-800 bg-slate-950/50 flex justify-end gap-2 shrink-0"><button onClick={() => { if (preCrackedResults && (preCrackedResults as any).downloadToken) window.location.href = `http://localhost:3001/api/download/check-result/${(preCrackedResults as any).downloadToken}`; }} disabled={preCrackedResults.found === 0} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold transition-colors disabled:opacity-50 flex items-center gap-2"><Download size={14} /> {t('modal_download')}</button><button onClick={() => setShowPreCrackedModal(false)} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold transition-colors">{t('modal_close')}</button></div>
                       </div>
                   </div>
                 )}
               </>
             )}
 
-            {activeTab === 'insights' && (<Insights globalPotfile={globalPotfile} sessionHashes={currentDisplayedCracks} session={session} pastSessions={pastSessions} config={config} setConfig={setConfig} setActiveTab={setActiveTab} addLog={addLog}/>)}
-            {activeTab === 'escrow' && (<EscrowDashboard apiKey={apiKey} setApiKey={setApiKey} initialSubmissionData={escrowSubmissionData} initialAlgoId={escrowSubmissionAlgo} autoUploadSettings={autoUploadSettings} onUpdateAutoUploadSettings={setAutoUploadSettings} sessions={sessions} activeSessionId={activeSessionId} addLog={addLog} onSetTarget={async (content, algoId) => {
-                addLog('general', '[ESCROW] Saving hash list as target...', 'INFO');
-                try {
-                    const targetRes = await fetch(`${getSocketUrl()}/api/target`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ content: content.trim(), filename: `escrow_target_${Date.now()}.txt` })
-                    });
-                    if (!targetRes.ok) throw new Error('Failed to save target file');
-                    const targetData = await targetRes.json();
-                    setConfig(prev => ({ ...prev, targetPath: targetData.path }));
-                    setManualTargetInput(content.trim());
-                    setManualTargetFile(null);
-                    
-                    // Auto-detect hash type from escrow job's algorithm ID
-                    addLog('general', '[ESCROW] Detecting hash type from job algorithm...', 'INFO');
-                    try {
-                        if (algoId) {
-                            // Try direct match first (hashes.com algo ID → hashcat mode ID)
-                            const directMatch = HASH_TYPES.find(h => h.id === String(algoId));
-                            if (directMatch) {
-                                setConfig(prev => {
-                                    const updated = { ...prev, hashType: directMatch.id };
-                                    addLog('general', `[ESCROW] Direct match: Mode ${directMatch.id} - ${directMatch.name}`, 'SUCCESS');
-                                    return updated;
-                                });
-                            } else {
-                                // Fallback: try name-based matching
-                                const algoName = escrowAlgorithms.find(a => a.id === algoId)?.algorithmName;
-                                if (algoName) {
-                                    const normalized = algoName.toLowerCase().replace(/[^a-z0-9]/g, '');
-                                    const nameMatch = HASH_TYPES.find(h => {
-                                        const hNorm = h.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-                                        return hNorm === normalized || hNorm.includes(normalized) || normalized.includes(hNorm);
-                                    });
-                                    if (nameMatch) {
-                                        setConfig(prev => {
-                                            const updated = { ...prev, hashType: nameMatch.id };
-                                            addLog('general', `[ESCROW] Name match: Mode ${nameMatch.id} - ${nameMatch.name}`, 'SUCCESS');
-                                            return updated;
-                                        });
-                                    } else {
-                                        addLog('general', `[ESCROW] Could not map algorithm "${algoName}" to a hash mode`, 'WARN');
-                                    }
-                                }
-                            }
-                        } else {
-                            addLog('general', '[ESCROW] No algorithm ID available for detection', 'WARN');
-                        }
-                    } catch (detectErr: any) {
-                        addLog('general', `[ESCROW] Hash type detection error: ${detectErr.message}`, 'WARN');
-                    }
-                    
-                    setActiveTab('dashboard');
-                    addLog('general', `[ESCROW] Hash list set as target: ${targetData.path}`, 'SUCCESS');
-                } catch (e: any) {
-                    addLog('general', `[ESCROW] Failed to set target: ${e.message}`, 'ERROR');
-                    console.error('[ESCROW] Failed to set target:', e);
-                }
-            }}/>)}
-            
             {/* File2John Component */}
             {activeTab === 'file2john' && (
-                <File2John 
+                <File2John
                     onSetTarget={async (hash, detectedMode) => {
                         const response = await fetch(`${getSocketUrl()}/api/target`, {
                           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2041,9 +1479,12 @@ function App() {
                     onNavigate={setActiveTab}
                 />
             )}
-            
+
             {activeTab === 'config' && (
                 <ConfigPanel
+                    initialTask={rerunTask}
+                    startError={startError}
+                    isStarting={isStarting}
                     config={config}
                     setConfig={setConfig}
                     onStart={(cmd) => { void handleStartTask(cmd); }}
@@ -2053,7 +1494,7 @@ function App() {
                     sessionHashrate={session.hashrate}
                 />
             )}
-            
+
             {activeTab === 'queue' && (<TaskManager
               tasks={tasks}
               selectedTaskId={selectedTaskId}
@@ -2064,6 +1505,15 @@ function App() {
               queueEnabled={isQueueProcessing}
               onToggleQueue={() => setIsQueueProcessing(value => !value)}
               onSelectTask={task => { setSelectedTaskId(task.id); setActiveSessionId(task.sessionId || null); }}
+              onRerun={task => {
+                if (!task.config) return;
+                setManualTargetInput('');
+                setManualTargetFile(null);
+                setConfig({ ...DEFAULT_CONFIG, ...task.config, targetPath: task.targetPath || task.config.targetPath || '' });
+                setRerunTask(task);
+                setStartError(null);
+                setActiveTab('config');
+              }}
               onResume={handleResumeTask}
               onStop={handleStopTask}
               onDelete={handleDeleteTask}
@@ -2071,8 +1521,7 @@ function App() {
               onSelectSession={setActiveSessionId}
               onDeleteSession={deleteSession}
             />)}
-            {activeTab === 'terminal' && !isRemoteSession && (<div className="h-[80vh]"><InteractiveTerminal socket={socketRef.current} disabled={status === SessionStatus.RUNNING || status === SessionStatus.PAUSED} /></div>)}
-            {activeTab === 'remote' && !isRemoteSession && (<RemoteAccess socket={socketRef.current} />)}
+            {activeTab === 'terminal' && (<div className="h-[80vh]"><InteractiveTerminal socket={socketRef.current} disabled={status === SessionStatus.RUNNING || status === SessionStatus.PAUSED} /></div>)}
           </div>
         </div>
       </main>

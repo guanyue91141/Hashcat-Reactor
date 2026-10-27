@@ -112,11 +112,7 @@ interface File2JohnProps {
 
 // --- API URL HELPER ---
 const getApiUrl = (endpoint: string) => {
-    const host = window.location.hostname;
-    const baseUrl = (host.includes('zrok.io') || window.location.port === '3001')
-        ? window.location.origin
-        : 'http://localhost:3001';
-    return `${baseUrl}${endpoint}`;
+    return `http://localhost:3001${endpoint}`;
 };
 
 const File2John: React.FC<File2JohnProps> = ({ onSetTarget, onNavigate }) => {

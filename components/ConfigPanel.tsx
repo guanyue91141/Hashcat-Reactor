@@ -54,6 +54,9 @@ interface ConfigPanelProps {
   onStartWorkflow?: (opts: SmartWorkflowOpts) => void;
   onQueueWorkflow?: (opts: SmartWorkflowOpts) => void;
   sessionHashrate?: number; // live hashrate from current session, used for speed warnings
+  initialTask?: { workflowOpts?: SmartWorkflowOpts; customCommand?: string } | null;
+  startError?: string | null;
+  isStarting?: boolean;
 }
 
 interface ResourceFile {
@@ -67,15 +70,9 @@ interface Resources {
   masks: ResourceFile[];
 }
 
-const getSocketUrl = () => {
-    const host = window.location.hostname;
-    if (host.includes('zrok.io') || window.location.port === '3001') {
-        return window.location.origin;
-    }
-    return 'http://localhost:3001';
-};
+const getSocketUrl = () => 'http://localhost:3001';
 
-const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig: propSetConfig, onStart, onQueue, onStartWorkflow, onQueueWorkflow, sessionHashrate }) => {
+const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig: propSetConfig, onStart, onQueue, onStartWorkflow, onQueueWorkflow, sessionHashrate, initialTask, startError, isStarting }) => {
   const { t } = useTranslation();
   
   // Cast to ExtendedConfig to support new fields locally
@@ -83,8 +80,8 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
   const setConfig = propSetConfig as (config: ExtendedConfig) => void;
 
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [isManualMode, setIsManualMode] = useState(false);
-  const [manualCommand, setManualCommand] = useState('');
+  const [isManualMode, setIsManualMode] = useState(!!initialTask?.customCommand);
+  const [manualCommand, setManualCommand] = useState(initialTask?.customCommand || '');
   const [detecting, setDetecting] = useState(false);
   
   const [availableDevices, setAvailableDevices] = useState<{id: string, name: string, type: string}[]>([]);
@@ -116,8 +113,8 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
   const [swOpts, setSwOpts] = useState<SmartWorkflowOpts>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(SW_STORAGE_KEY) || '{}');
-      return { ...SW_DEFAULTS, ...saved };
-    } catch { return SW_DEFAULTS; }
+      return { ...SW_DEFAULTS, ...saved, ...initialTask?.workflowOpts };
+    } catch { return { ...SW_DEFAULTS, ...initialTask?.workflowOpts }; }
   });
 
   // Persist swOpts to localStorage whenever they change
@@ -394,6 +391,7 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full">
       <div className="lg:col-span-2 space-y-6 overflow-y-auto pr-2 pb-10">
+        {startError && <div role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">{startError}</div>}
         
         {/* 1. GENERAL CONFIGURATION */}
         <div className="bg-slate-900 border border-slate-800 p-6 rounded-xl shadow-sm">
@@ -823,7 +821,8 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
         </div>
         <div className="relative bg-black/40 min-h-[150px]"><textarea className={`w-full h-full min-h-[150px] p-4 font-mono text-xs bg-transparent resize-y outline-none ${isManualMode ? 'text-yellow-400 focus:ring-1 focus:ring-yellow-500/50' : 'text-emerald-400 select-text'}`} value={isManualMode ? manualCommand : commandString} onChange={(e) => setManualCommand(e.target.value)} readOnly={!isManualMode} spellCheck={false} /></div>
         <div className="bg-slate-900 p-4 border-t border-slate-800 flex flex-col gap-3">
-           <div className="flex gap-3"><button onClick={handleCopy} className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 py-2.5 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"><Copy size={16} /> {t('config_btn_copy')}</button><button onClick={handleRun} className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white py-2.5 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-indigo-500/20 flex items-center justify-center gap-2"><Play size={16} /> {isManualMode ? t('config_btn_run_custom') : t('config_btn_run_auto')}</button></div>
+           {startError && <div role="alert" className="mb-2 text-sm text-red-300">{startError}</div>}
+           <div className="flex gap-3"><button onClick={handleCopy} className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 py-2.5 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"><Copy size={16} /> {t('config_btn_copy')}</button><button onClick={handleRun} disabled={isStarting} className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white py-2.5 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-indigo-500/20 flex items-center justify-center gap-2"><Play size={16} /> {isManualMode ? t('config_btn_run_custom') : t('config_btn_run_auto')}</button></div>
            {!isManualMode && (<button onClick={onQueue} className="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:text-white text-slate-300 py-2.5 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"><ListPlus size={16} /> {t('config_btn_queue')}</button>)}
         </div>
 
@@ -1142,7 +1141,7 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
           <div className="flex gap-2">
             <button
               onClick={() => onStartWorkflow && onStartWorkflow({ ...swOpts, rulePath: config.rulePath || '' })}
-              disabled={!onStartWorkflow || !config.wordlistPath}
+              disabled={isStarting || !onStartWorkflow || !config.wordlistPath}
               className="flex-1 flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white py-2.5 rounded-lg text-sm font-bold transition-colors shadow-lg shadow-indigo-500/20"
             >
               <Workflow size={15} />

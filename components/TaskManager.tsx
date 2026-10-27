@@ -16,6 +16,7 @@ interface Props {
   queueEnabled: boolean;
   onToggleQueue: () => void;
   onSelectTask: (task: ReactorTask) => void;
+  onRerun: (task: ReactorTask) => void;
   onResume: (task: ReactorTask) => void;
   onStop: (task: ReactorTask) => void;
   onDelete: (task: ReactorTask) => void;
@@ -26,7 +27,7 @@ interface Props {
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'STOPPED']);
 
-const TaskManager: React.FC<Props> = ({ tasks, selectedTaskId, activeSessionId, sessions, logs, cracks, queueEnabled, onToggleQueue, onSelectTask, onResume, onStop, onDelete, onClearFinished, onSelectSession, onDeleteSession }) => {
+const TaskManager: React.FC<Props> = ({ tasks, selectedTaskId, activeSessionId, sessions, logs, cracks, queueEnabled, onToggleQueue, onSelectTask, onRerun, onResume, onStop, onDelete, onClearFinished, onSelectSession, onDeleteSession }) => {
   const { t } = useTranslation();
   const selected = tasks.find(task => task.id === selectedTaskId) || null;
   const selectedStats = selected?.sessionId ? sessions[selected.sessionId] : undefined;
@@ -74,6 +75,7 @@ const TaskManager: React.FC<Props> = ({ tasks, selectedTaskId, activeSessionId, 
               <td className="p-3 text-xs text-slate-400">{stats ? `${stats.progress.toFixed(1)}% · ${stats.recovered}/${stats.total}` : `${task.recovered || 0}/${task.totalHashes || '—'}`}</td>
               <td className="p-3 text-xs text-slate-500 whitespace-nowrap"><Clock size={12} className="inline mr-1" />{new Date(task.createdAt).toLocaleString()}</td>
               <td className="p-3 text-right whitespace-nowrap" onClick={event => event.stopPropagation()}>
+                <button type="button" onClick={() => onRerun(task)} disabled={!task.config} title={task.config ? t('task_rerun') : t('task_rerun_unavailable')} aria-label={task.config ? t('task_rerun') : t('task_rerun_unavailable')} className="p-2 mr-1 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 disabled:opacity-30 disabled:cursor-not-allowed"><PlayRerunIcon /></button>
                 {task.status === 'INTERRUPTED' && <button onClick={() => onResume(task)} disabled={!task.resumeAvailable || !task.sessionId} title={!task.resumeAvailable ? t('task_restore_unavailable') : t('task_resume')} className="p-2 mr-1 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 disabled:opacity-30"><RefreshCw size={14} /></button>}
                 {['RUNNING', 'PAUSED'].includes(task.status) && <button onClick={() => onStop(task)} title={t('btn_stop')} className="p-2 mr-1 rounded bg-red-500/10 text-red-300 border border-red-500/20"><Square size={14} /></button>}
                 {task.status === 'RUNNING' && <Activity size={15} className="inline mr-2 text-emerald-400 animate-pulse" />}
@@ -97,5 +99,7 @@ const TaskManager: React.FC<Props> = ({ tasks, selectedTaskId, activeSessionId, 
     </div>}
   </div>;
 };
+
+const PlayRerunIcon = () => <RefreshCw size={14} aria-hidden="true" />;
 
 export default TaskManager;

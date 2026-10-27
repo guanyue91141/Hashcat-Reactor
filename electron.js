@@ -34,19 +34,14 @@ function startServer() {
 
   const serverPath = path.join(backendDir, 'server.js');
   
-  // 2. Calculate Frontend Path 
-  const frontendDir = path.join(__dirname, 'dist'); 
-
   console.log(`[Electron] Launching server from: ${serverPath}`);
-  console.log(`[Electron] Frontend serving path: ${frontendDir}`);
 
   // 3. Setup Environment
   const env = {
     ...process.env,
     IS_ELECTRON: 'true',
     USER_DATA_PATH: app.getPath('userData'), 
-    RESOURCES_PATH: process.resourcesPath,
-    FRONTEND_BUILD_PATH: frontendDir 
+    RESOURCES_PATH: process.resourcesPath
   };
 
   try {

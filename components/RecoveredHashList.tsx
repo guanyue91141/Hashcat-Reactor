@@ -1,15 +1,14 @@
 import React, { useRef } from 'react'; 
 import { Virtuoso } from 'react-virtuoso';
 import { RecoveredHash } from '../types';
-import { ShieldCheck, Copy, Globe, CheckCircle } from 'lucide-react';
+import { ShieldCheck, Copy } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 interface Props {
   hashes: RecoveredHash[];
-  onSendToEscrow?: (hashes: RecoveredHash[]) => void;
 }
 
-const RecoveredHashList = React.memo<Props>(({ hashes, onSendToEscrow }) => {
+const RecoveredHashList = React.memo<Props>(({ hashes }) => {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -34,9 +33,6 @@ const RecoveredHashList = React.memo<Props>(({ hashes, onSendToEscrow }) => {
       return plain;
   };
 
-  const newHashes = hashes.filter(h => !h.sentToEscrow);
-  const newCount = newHashes.length;
-
   return (
     <div className="flex flex-col h-full bg-slate-950 border border-slate-800 rounded-xl overflow-hidden shadow-inner min-h-0">
       <div className="bg-slate-900 px-4 py-3 border-b border-slate-800 flex items-center justify-between shrink-0">
@@ -47,20 +43,6 @@ const RecoveredHashList = React.memo<Props>(({ hashes, onSendToEscrow }) => {
                 {hashes.length}
             </span>
         </div>
-        {onSendToEscrow && (
-            <button 
-                onClick={() => onSendToEscrow(hashes)}
-                disabled={newCount === 0}
-                className={`flex items-center gap-2 text-xs px-3 py-1.5 rounded transition-all font-medium border ${
-                  newCount > 0 
-                    ? 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500' 
-                    : 'bg-slate-800 text-slate-500 border-slate-700 cursor-not-allowed opacity-50'
-                }`}
-            >
-                <Globe size={14} /> 
-                {newCount > 0 ? t('btn_send_new') : t('btn_all_sent')}
-            </button>
-        )}
       </div>
       
       <div 
@@ -80,17 +62,10 @@ const RecoveredHashList = React.memo<Props>(({ hashes, onSendToEscrow }) => {
                 const readablePlain = decodePlain(item.plain);
                 return (
                     <div 
-                      className={`p-3 border-b border-slate-800/50 transition-colors flex items-center justify-between group ${
-                        item.sentToEscrow ? 'bg-slate-900/30 hover:bg-slate-900/50' : 'hover:bg-slate-900/50'
-                      }`}
+                      className="p-3 border-b border-slate-800/50 transition-colors flex items-center justify-between group hover:bg-slate-900/50"
                     >
                         <div className="flex items-center gap-3 overflow-hidden">
-                            {item.sentToEscrow && (
-                              <div title={t('rec_sent_tooltip')}>
-                                <CheckCircle size={14} className="text-emerald-500/50" />
-                              </div>
-                            )}
-                            <div className={`flex flex-col gap-0.5 overflow-hidden ${item.sentToEscrow ? 'opacity-50' : ''}`}>
+                            <div className="flex flex-col gap-0.5 overflow-hidden">
                                 <span className="text-emerald-400 font-mono text-sm font-bold truncate" title={readablePlain}>
                                     {readablePlain}
                                 </span>

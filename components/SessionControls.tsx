@@ -5,11 +5,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import { SessionStatus } from '../types';
 
-const getApiUrl = () => {
-    const host = window.location.hostname;
-    if (host.includes('zrok.io') || window.location.port === '3001') return window.location.origin;
-    return 'http://localhost:3001';
-};
+const getApiUrl = () => 'http://localhost:3001';
 
 interface SessionControlsProps {
     sessionId: string | null;

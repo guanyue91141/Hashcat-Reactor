@@ -23,7 +23,6 @@ export interface RecoveredHash {
   plain: string;
   algorithmId: string;
   timestamp: number;
-  sentToEscrow?: boolean;
 }
 
 export interface SessionStats {
@@ -103,28 +102,6 @@ export interface ReactorTask {
   workflowOpts?: SmartWorkflowOpts;
   customCommand?: string;
   legacy?: boolean;
-}
-
-// Hashes.com Interfaces
-export interface EscrowJob {
-  id: number;
-  createdAt: string;
-  lastUpdate: string;
-  algorithmName: string;
-  algorithmId: number;
-  totalHashes: number;
-  foundHashes: number;
-  leftHashes: number;
-  currency: string;
-  pricePerHash: string;
-  pricePerHashUsd: string;
-  maxCracksNeeded: number;
-  leftList: string; 
-}
-
-export interface EscrowAlgo {
-  id: number;
-  algorithmName: string;
 }
 
 // Hashcat Configuration
