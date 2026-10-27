@@ -12,9 +12,10 @@ interface LogTerminalProps {
   activeSessionId: string | null;
   onSelectSession: (id: string | null) => void;
   onDeleteSession: (id: string) => void;
+  showSessionList?: boolean;
 }
 
-const LogTerminal = React.memo<LogTerminalProps>(({ logs, sessions, activeSessionId, onSelectSession, onDeleteSession }) => {
+const LogTerminal = React.memo<LogTerminalProps>(({ logs, sessions, activeSessionId, onSelectSession, onDeleteSession, showSessionList = true }) => {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -62,7 +63,7 @@ const LogTerminal = React.memo<LogTerminalProps>(({ logs, sessions, activeSessio
   return (
     <div className="flex h-full bg-slate-950 border border-slate-800 rounded-xl overflow-hidden shadow-inner min-h-0">
       {/* Session Sidebar */}
-      <div className="w-44 bg-slate-900 border-r border-slate-800 flex flex-col shrink-0">
+      {showSessionList && <div className="w-44 bg-slate-900 border-r border-slate-800 flex flex-col shrink-0">
         <div className="p-3 border-b border-slate-800 text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
             <span>{t('log_sessions_title')}</span>
             <button
@@ -117,7 +118,7 @@ const LogTerminal = React.memo<LogTerminalProps>(({ logs, sessions, activeSessio
                 );
             })}
         </div>
-      </div>
+      </div>}
 
       {/* Terminal Area */}
       <div className="flex-1 flex flex-col min-w-0">
@@ -135,7 +136,7 @@ const LogTerminal = React.memo<LogTerminalProps>(({ logs, sessions, activeSessio
             className="flex-1 p-4 overflow-y-auto space-y-1 font-mono text-xs md:text-sm"
         >
             {(!logs || logs.length === 0) ? (
-                <div className="text-slate-600 italic">{t('log_waiting')}</div>
+                <div className="text-slate-600 italic">{activeSessionId ? t('log_empty_session') : t('log_waiting')}</div>
             ) : (
                 logs.map((log) => (
                   <div key={log.id} className="break-all opacity-90 hover:opacity-100 transition-opacity">

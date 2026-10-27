@@ -10,7 +10,7 @@ import {
   FileKey, Workflow, ChevronDown, CheckCircle2, SkipForward, Clock
 } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
-import { SessionStats, SessionStatus, LogEntry, HistoryPoint, HashcatConfig, RecoveredHash, QueueItem, EscrowAlgo, SmartWorkflowOpts } from './types';
+import { SessionStats, SessionStatus, LogEntry, HistoryPoint, HashcatConfig, RecoveredHash, QueueItem, EscrowAlgo, SmartWorkflowOpts, ReactorTask } from './types';
 import { INITIAL_SESSION, DEFAULT_CONFIG, HASH_TYPES } from './constants';
 import LogTerminal from './components/LogTerminal';
 import InteractiveTerminal from './components/InteractiveTerminal';
@@ -18,7 +18,7 @@ import CpuChart from './components/CpuChart';
 import ConfigPanel from './components/ConfigPanel';
 import EscrowDashboard, { AutoUploadSettings } from './components/EscrowDashboard';
 import RecoveredHashList from './components/RecoveredHashList';
-import QueueManager from './components/QueueManager';
+import TaskManager from './components/TaskManager';
 import Insights, { PastSession } from './components/Insights';
 import PowerGraph from './components/PowerGraph';
 import RemoteAccess from './components/RemoteAccess';
@@ -26,6 +26,29 @@ import File2John from './components/File2John';
 import SessionControls from './components/SessionControls';
 
 const uuid = () => Math.random().toString(36).substring(2, 9);
+const SESSION_LOG_STORAGE_KEY = 'reactor_session_logs';
+const SESSION_LOG_RETENTION_MS = 24 * 60 * 60 * 1000;
+const SESSION_LOG_LIMIT = 500;
+const SESSION_LOG_SESSION_LIMIT = 12;
+
+const readSavedSessionLogs = (): Record<string, LogEntry[]> => {
+  try {
+    const saved = localStorage.getItem(SESSION_LOG_STORAGE_KEY);
+    if (!saved) return {};
+    const parsed = JSON.parse(saved) as Record<string, LogEntry[]>;
+    const cutoff = Date.now() - SESSION_LOG_RETENTION_MS;
+    return Object.fromEntries(Object.entries(parsed).map(([sessionId, entries]) => [
+      sessionId,
+      (Array.isArray(entries) ? entries : [])
+        .map(entry => ({ ...entry, timestamp: new Date(entry.timestamp) }))
+        .filter(entry => !Number.isNaN(entry.timestamp.getTime()) && entry.timestamp.getTime() >= cutoff)
+        .slice(-SESSION_LOG_LIMIT),
+    ]).filter(([, entries]) => (entries as LogEntry[]).length > 0));
+  } catch (error) {
+    console.warn('Could not restore saved session logs', error);
+    return {};
+  }
+};
 
 const getAttackModeName = (mode: number) => {
     switch (mode) {
@@ -321,11 +344,14 @@ function App() {
   }, [sessions]);
 
   const sessionsRef = useRef(sessions);
-  const [sessionLogs, setSessionLogs] = useState<Record<string, LogEntry[]>>({});
+  const [sessionLogs, setSessionLogs] = useState<Record<string, LogEntry[]>>(readSavedSessionLogs);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   
   const [globalPotfile, setGlobalPotfile] = useState<RecoveredHash[]>([]);
   const [jobQueue, setJobQueue] = useState<QueueItem[]>([]);
+  const [tasks, setTasks] = useState<ReactorTask[]>([]);
+  const tasksRef = useRef(tasks);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [isQueueProcessing, setIsQueueProcessing] = useState(true);
   const [isLangMenuOpen, setIsLangMenuOpen] = useState(false);
 
@@ -346,6 +372,7 @@ function App() {
   }, [activeSessionId, sessionLogs]);
 
   const status = session.status;
+  const isSessionTargetLocked = status === SessionStatus.RUNNING || status === SessionStatus.PAUSED;
   const [history, setHistory] = useState<HistoryPoint[]>([]);
   
   const [escrowSubmissionData, setEscrowSubmissionData] = useState<string>('');
@@ -363,8 +390,6 @@ function App() {
   // the async sessions state to flush.
   const sessionFinalStatusRef = useRef<Record<string, string>>({});
 
-  const [restoreMode, setRestoreMode] = useState(false); 
-  
   const [pastSessions, setPastSessions] = useState<PastSession[]>([]);
   
   const sessionStartTimes = useRef<Record<string, number>>({});
@@ -400,6 +425,65 @@ function App() {
   useEffect(() => {
       sessionsRef.current = sessions;
   }, [sessions]);
+
+  const updateTask = async (taskId: string, patch: Partial<ReactorTask>) => {
+    setTasks(prev => {
+      const next = prev.map(task => task.id === taskId ? { ...task, ...patch } : task);
+      tasksRef.current = next;
+      return next;
+    });
+    try {
+      const response = await fetch(`${getSocketUrl()}/api/tasks/${encodeURIComponent(taskId)}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+      });
+      if (!response.ok) throw new Error((await response.json()).message || 'Task update failed');
+    } catch (error) { console.error('Could not persist task update', error); }
+  };
+
+  const updateTaskBySession = (sessionId: string, patch: Partial<ReactorTask>) => {
+    const task = tasksRef.current.find(item => item.sessionId === sessionId);
+    if (task) void updateTask(task.id, patch);
+  };
+
+  const refreshTasks = async () => {
+    try {
+      const response = await fetch(`${getSocketUrl()}/api/tasks`);
+      if (!response.ok) throw new Error((await response.json()).message || 'Task list could not be loaded');
+      const loaded: ReactorTask[] = await response.json();
+      setTasks(loaded);
+      tasksRef.current = loaded;
+      setJobQueue(loaded
+        .filter(task => task.status === 'QUEUED' && task.config)
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .map(task => ({ id: task.id, config: task.config!, status: 'PENDING', addedAt: task.createdAt, targetSummary: task.targetSummary, workflowOpts: task.workflowOpts })));
+      setSelectedTaskId(current => current && loaded.some(task => task.id === current) ? current : (loaded[0]?.id || null));
+    } catch (error) { console.error('Could not load task list', error); }
+  };
+
+  const persistNewTask = async (task: ReactorTask) => {
+    const response = await fetch(`${getSocketUrl()}/api/tasks`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(task),
+    });
+    if (!response.ok) throw new Error((await response.json()).message || 'Could not save task');
+    const saved: ReactorTask = await response.json();
+    setTasks(prev => {
+      const next = [saved, ...prev.filter(item => item.id !== saved.id)];
+      tasksRef.current = next;
+      return next;
+    });
+    setSelectedTaskId(saved.id);
+    return saved;
+  };
+
+  useEffect(() => {
+    if (backendConnected) void refreshTasks();
+  }, [backendConnected]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    const selected = tasks.find(task => task.id === selectedTaskId);
+    if (selected) setActiveSessionId(selected.sessionId || null);
+  }, [selectedTaskId, tasks]);
 
   useEffect(() => {
       smartWorkflowStateRef.current = smartWorkflowState;
@@ -664,6 +748,7 @@ function App() {
                   const qCfg = nextJob.config;
                   const unitToSec = wOpts.phase3TimeUnit === 'minutes' ? 60 : wOpts.phase3TimeUnit === 'hours' ? 3600 : 86400;
                   const payload = {
+                      taskId: nextJob.id,
                       targetPath: qCfg.targetPath,
                       hashType: qCfg.hashType,
                       wordlistPath: qCfg.wordlistPath,
@@ -701,8 +786,10 @@ function App() {
                       body: JSON.stringify(payload),
                   });
                   const data = await res.json();
+                  if (!res.ok) throw new Error(data.message || 'Smart workflow could not start.');
                   if (data.workflowId) {
                       runningConfigs.current[data.workflowId] = nextJob.config;
+                      void updateTask(nextJob.id, { status: 'RUNNING', sessionId: data.workflowId, startedAt: Date.now() });
                       // Force-select the new workflow so the Smart Workflow widget
                       // gates on the right activeSessionId. The session_started
                       // handler also tries to do this, but only when isStartingRef
@@ -712,6 +799,8 @@ function App() {
                       setJobQueue(prev => prev.slice(1));
                       setActiveTab('dashboard');
                   } else {
+                      void updateTask(nextJob.id, { status: 'FAILED', endedAt: Date.now(), failureReason: 'Backend did not return a workflow id.' });
+                      setJobQueue(prev => prev.slice(1));
                       sessionRunningRef.current = false;
                   }
               } else {
@@ -721,24 +810,28 @@ function App() {
                   setSmartWorkflowState(null);
                   smartWorkflowStateRef.current = null;
                   setSmartPhase(null);
-                  const payload = { ...nextJob.config };
+                  const payload = { ...nextJob.config, taskId: nextJob.id };
                   const res = await fetch(getSocketUrl() + '/api/session/start', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify(payload)
                   });
                   const data = await res.json();
+                  if (!res.ok) throw new Error(data.message || 'Hashcat session could not start.');
                   if (data.sessionId) {
                       runningConfigs.current[data.sessionId] = nextJob.config;
+                      void updateTask(nextJob.id, { status: 'RUNNING', sessionId: data.sessionId, startedAt: Date.now() });
                       setActiveSessionId(data.sessionId);
                       setJobQueue(prev => prev.slice(1));
                       setActiveTab('dashboard');
                   } else {
+                  void updateTask(nextJob.id, { status: 'FAILED', endedAt: Date.now(), failureReason: 'Backend did not return a session id.' });
                       sessionRunningRef.current = false;
                   }
               }
           } catch (e: any) {
               addLog('general', `[QUEUE] Failed to start job: ${e.message}`, 'ERROR');
+              void updateTask(nextJob.id, { status: 'FAILED', endedAt: Date.now(), failureReason: e.message || String(e) });
               setJobQueue(prev => prev.slice(1));
               sessionRunningRef.current = false;
           } finally {
@@ -771,7 +864,7 @@ function App() {
           setGlobalPotfile(data);
           addLog('general', `[SYSTEM] Loaded ${data.length} historical hashes.`, 'INFO');
       });
-      socket.on('session_started', ({ sessionId, name, target, recoveredHashes, hashType, attackMode }: any) => {
+      socket.on('session_started', ({ sessionId, taskId, name, target, recoveredHashes, hashType, attackMode }: any) => {
           sessionRunningRef.current = true;
           setSessions(prev => {
               const existing = prev[sessionId];
@@ -790,12 +883,16 @@ function App() {
                 }
             };
           });
+          const linkedTask = tasksRef.current.find(task => task.id === taskId || task.sessionId === sessionId);
+          if (linkedTask) void updateTask(linkedTask.id, { sessionId, status: 'RUNNING', startedAt: linkedTask.startedAt || Date.now() });
           if (!sessionStartTimes.current[sessionId]) sessionStartTimes.current[sessionId] = Date.now();
           if (isStartingRef.current) setActiveSessionId(sessionId);
       });
       socket.on('session_status', (data: { sessionId: string, status: string }) => {
          const { sessionId, status: rawStatus } = data;
-         sessionFinalStatusRef.current[sessionId] = rawStatus;
+         const previousStatus = sessionFinalStatusRef.current[sessionId];
+         const wasStopped = previousStatus === 'STOPPED' && rawStatus === 'COMPLETED';
+         if (!wasStopped) sessionFinalStatusRef.current[sessionId] = rawStatus;
          let newStatus = SessionStatus.IDLE;
          if (rawStatus === 'RUNNING') newStatus = SessionStatus.RUNNING;
          else if (rawStatus === 'PAUSED') newStatus = SessionStatus.PAUSED;
@@ -803,6 +900,11 @@ function App() {
          else if (rawStatus === 'ERROR') newStatus = SessionStatus.ERROR;
          else if (rawStatus === 'STOPPED') newStatus = SessionStatus.STOPPED;
          updateSession(sessionId, { status: newStatus });
+         if (wasStopped) return;
+         if (rawStatus === 'RUNNING') updateTaskBySession(sessionId, { status: 'RUNNING', failureReason: undefined });
+         else if (rawStatus === 'PAUSED') updateTaskBySession(sessionId, { status: 'PAUSED' });
+         else if (rawStatus === 'ERROR') updateTaskBySession(sessionId, { status: 'FAILED', endedAt: Date.now() });
+         else if (rawStatus === 'STOPPED') updateTaskBySession(sessionId, { status: 'STOPPED', endedAt: Date.now() });
       });
       socket.on('session_finished', (data: any) => {
           sessionRunningRef.current = false;
@@ -838,12 +940,20 @@ function App() {
               smartWorkflowStateRef.current = finalized;
               setSmartWorkflowState(finalized);
           }
+          const finalState = sessionFinalStatusRef.current[data.sessionId];
+          const linkedTask = tasksRef.current.find(task => task.id === data.taskId || task.sessionId === data.sessionId);
+          if (linkedTask) void updateTask(linkedTask.id, {
+            status: finalState === 'ERROR' || (typeof data.code === 'number' && data.code !== 0 && !['COMPLETED', 'STOPPED'].includes(finalState)) ? 'FAILED' : finalState === 'STOPPED' ? 'STOPPED' : 'COMPLETED',
+            endedAt: Date.now(), recovered: data.recovered || 0, totalHashes: data.total || 0,
+            exitCode: typeof data.code === 'number' ? data.code : undefined,
+          });
           saveSessionHistory(data.sessionId, data.duration, data.recovered, data.total, data.avgHashrate, data.avgPower);
           flushSessionHashes(data.sessionId);
       });
       socket.on('session_deleted', (data: { sessionId: string }) => {
           sessionRunningRef.current = false;
           setSessions(prev => { const next = { ...prev }; delete next[data.sessionId]; return next; });
+          setSessionLogs(prev => { const next = { ...prev }; delete next[data.sessionId]; return next; });
           if (activeSessionId === data.sessionId) setActiveSessionId(null);
       });
       socket.on('stats_update', (data: any) => {
@@ -945,31 +1055,47 @@ function App() {
       } catch(e) { console.error("Failed to delete session", e); }
   };
 
-  // Rolling log window. Sessions can run for days; keeping every line would balloon
-  // memory and slow rendering. Drop entries older than LOG_RETENTION_MS on every
-  // append, with a hard cap as a safety net for bursts inside the retention window.
-  const LOG_RETENTION_MS = 3 * 60 * 1000; // ~3 minutes
-  const LOG_HARD_CAP = 1000;
+  // Keep a bounded, local log history so selecting a completed session or
+  // reopening the app does not leave its log pane inexplicably empty.
   const addLog = (sessionId: string, message: string, level: LogEntry['level'] = 'INFO') => {
     const entry = { id: uuid(), sessionId, timestamp: new Date(), level, message };
     setSessionLogs(prev => {
         const sessionLog = prev[sessionId] || [];
-        const cutoff = Date.now() - LOG_RETENTION_MS;
+        const cutoff = Date.now() - SESSION_LOG_RETENTION_MS;
         const pruned = sessionLog.filter(l => {
             const t = l.timestamp instanceof Date ? l.timestamp.getTime() : new Date(l.timestamp).getTime();
             return t >= cutoff;
         });
-        const capped = pruned.length > LOG_HARD_CAP ? pruned.slice(-LOG_HARD_CAP) : pruned;
-        return { ...prev, [sessionId]: [...capped, entry] };
+        const capped = [...pruned, entry].slice(-SESSION_LOG_LIMIT);
+        return { ...prev, [sessionId]: capped };
     });
   };
 
-  // Periodic cleanup so stale logs drop out of view even while the session is idle
-  // (no new appends triggering the in-addLog prune).
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      try {
+        const cutoff = Date.now() - SESSION_LOG_RETENTION_MS;
+        const entries = Object.entries(sessionLogs)
+          .map(([sessionId, logs]) => [sessionId, logs.filter(log => new Date(log.timestamp).getTime() >= cutoff).slice(-SESSION_LOG_LIMIT)] as const)
+          .filter(([, logs]) => logs.length > 0);
+        const general = entries.find(([sessionId]) => sessionId === 'general');
+        const recentSessions = entries
+          .filter(([sessionId]) => sessionId !== 'general')
+          .sort((a, b) => new Date(b[1][b[1].length - 1].timestamp).getTime() - new Date(a[1][a[1].length - 1].timestamp).getTime())
+          .slice(0, SESSION_LOG_SESSION_LIMIT);
+        localStorage.setItem(SESSION_LOG_STORAGE_KEY, JSON.stringify(Object.fromEntries([...recentSessions, ...(general ? [general] : [])])));
+      } catch (error) {
+        console.warn('Could not save session logs', error);
+      }
+    }, 250);
+    return () => clearTimeout(timeout);
+  }, [sessionLogs]);
+
+  // Periodic cleanup so stale logs drop out of view even while the session is idle.
   useEffect(() => {
     const interval = setInterval(() => {
         setSessionLogs(prev => {
-            const cutoff = Date.now() - LOG_RETENTION_MS;
+            const cutoff = Date.now() - SESSION_LOG_RETENTION_MS;
             let changed = false;
             const next: Record<string, LogEntry[]> = {};
             for (const sid of Object.keys(prev)) {
@@ -983,7 +1109,7 @@ function App() {
             }
             return changed ? next : prev;
         });
-    }, 30000);
+    }, 5 * 60 * 1000);
     return () => clearInterval(interval);
   }, []);
 
@@ -1126,37 +1252,145 @@ function App() {
       return '';
   };
 
+  const resolveTaskTarget = async () => {
+      const manualPath = await prepareTarget();
+      if (manualPath) return {
+        targetPath: manualPath,
+        targetSummary: manualTargetFile ? manualTargetFile.name : 'Manual Input Buffer',
+      };
+      if (config.targetPath) return {
+        targetPath: config.targetPath,
+        targetSummary: config.targetPath.split(/[\\/]/).pop() || config.targetPath,
+      };
+      return null;
+  };
+
+  const clearDraftTarget = () => {
+    setManualTargetInput('');
+    setManualTargetFile(null);
+    setConfig(prev => ({ ...prev, targetPath: '' }));
+  };
+
   const handleAddToQueue = async () => {
       try {
-          // Prefer the user's current manual selection (uploads fresh) over any
-          // stale config.targetPath left over from a prior Escrow / library pick.
-          // Otherwise the queue snapshots the old path and the run fails on a
-          // multer-named upload that no longer matches what the user picked.
-          let targetPath = '';
-          let targetSummary = '';
-          const manualPath = await prepareTarget();
-          if (manualPath) {
-              targetPath = manualPath;
-              targetSummary = manualTargetFile ? manualTargetFile.name : 'Manual Input Buffer';
-          } else if (config.targetPath) {
-              targetPath = config.targetPath;
-              targetSummary = config.targetPath.split(/[\\/]/).pop() || config.targetPath;
-          } else {
+          const target = await resolveTaskTarget();
+          if (!target) {
               addLog('general', 'Cannot queue: No target selected.', 'ERROR');
               return;
           }
-          const queueConfig = { ...config, targetPath };
+          const taskId = `task_${Date.now()}_${uuid()}`;
+          const queueConfig = { ...config, targetPath: target.targetPath };
+          const now = Date.now();
+          await persistNewTask({
+            id: taskId, targetPath: target.targetPath, targetSummary: target.targetSummary,
+            config: queueConfig, status: 'QUEUED', createdAt: now, recovered: 0,
+          });
+          clearDraftTarget();
           const newJob: QueueItem = {
-              id: uuid(),
+              id: taskId,
               config: queueConfig,
               status: 'PENDING',
-              addedAt: Date.now(),
-              targetSummary: targetSummary || 'Unknown'
+              addedAt: now,
+              targetSummary: target.targetSummary,
           };
           setJobQueue(prev => [...prev, newJob]);
           addLog('general', `Added job to queue. Position: ${jobQueue.length + 1}`, 'SUCCESS');
           setActiveTab('queue');
       } catch (e: any) { addLog('general', `Queue Error: ${e.message}`, 'ERROR'); }
+  };
+
+  const handleStartTask = async (customCommand?: string) => {
+    if (!backendConnected) { addLog('general', 'Backend disconnected.', 'ERROR'); return; }
+    setIsStarting(true);
+    sessionRunningRef.current = true;
+    let pendingTaskId: string | null = null;
+    try {
+      const target = await resolveTaskTarget();
+      if (!target && !customCommand) throw new Error('No target selected.');
+      const taskId = `task_${Date.now()}_${uuid()}`;
+      const taskConfig = { ...config, targetPath: target?.targetPath || config.targetPath || '' };
+      const task = await persistNewTask({
+        id: taskId, targetPath: target?.targetPath, targetSummary: target?.targetSummary || 'Custom command',
+        config: taskConfig, status: 'QUEUED', createdAt: Date.now(),
+        recovered: 0, customCommand: customCommand || undefined,
+      });
+      pendingTaskId = task.id;
+      clearDraftTarget();
+      const response = await fetch(`${getSocketUrl()}/api/session/start`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(customCommand ? { customCommand, taskId: task.id } : { ...taskConfig, taskId: task.id }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.sessionId) throw new Error(data.message || 'Hashcat did not start.');
+      runningConfigs.current[data.sessionId] = taskConfig;
+      await updateTask(task.id, { status: 'RUNNING', sessionId: data.sessionId });
+      updateSession(data.sessionId, { hashType: taskConfig.hashType });
+      setActiveSessionId(data.sessionId);
+      setActiveTab('dashboard');
+      setSmartWorkflowState(null);
+      setSmartPhase(null);
+    } catch (e: any) {
+      sessionRunningRef.current = false;
+      addLog('general', `Start Error: ${e.message}`, 'ERROR');
+      if (pendingTaskId) void updateTask(pendingTaskId, { status: 'FAILED', endedAt: Date.now(), failureReason: e.message || String(e) });
+    } finally { setIsStarting(false); }
+  };
+
+  const handleResumeTask = async (task: ReactorTask) => {
+    if (!backendConnected || !task.sessionId || !task.config) return;
+    try {
+      setIsStarting(true);
+      const response = await fetch(`${getSocketUrl()}/api/session/start`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...task.config, restore: true, sessionId: task.sessionId, taskId: task.id }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.sessionId) throw new Error(data.message || 'Could not resume task.');
+      sessionRunningRef.current = true;
+      runningConfigs.current[task.sessionId] = task.config;
+      await updateTask(task.id, { status: 'RUNNING', startedAt: Date.now(), endedAt: undefined, failureReason: undefined, resumeAvailable: false });
+      setSelectedTaskId(task.id);
+      setActiveSessionId(task.sessionId);
+      setActiveTab('queue');
+    } catch (e: any) {
+      addLog('general', `Resume Error: ${e.message}`, 'ERROR');
+    } finally { setIsStarting(false); }
+  };
+
+  const handleStopTask = async (task: ReactorTask) => {
+    if (!task.sessionId) return;
+    try {
+      const response = await fetch(`${getSocketUrl()}/api/session/stop`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: task.sessionId }),
+      });
+      if (!response.ok) throw new Error((await response.json()).message || 'Could not stop task');
+    } catch (e: any) { addLog('general', `Stop task error: ${e.message}`, 'ERROR'); }
+  };
+
+  const handleDeleteTask = async (task: ReactorTask) => {
+    try {
+      const response = await fetch(`${getSocketUrl()}/api/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error((await response.json()).message || 'Could not delete task');
+      setTasks(prev => prev.filter(item => item.id !== task.id));
+      tasksRef.current = tasksRef.current.filter(item => item.id !== task.id);
+      setJobQueue(prev => prev.filter(item => item.id !== task.id));
+      if (selectedTaskId === task.id) setSelectedTaskId(null);
+    } catch (e: any) { addLog('general', `Delete task error: ${e.message}`, 'ERROR'); }
+  };
+
+  const handleClearFinishedTasks = async () => {
+    try {
+      const finished = tasksRef.current.filter(task => ['COMPLETED', 'FAILED', 'STOPPED'].includes(task.status));
+      await Promise.all(finished.map(async task => {
+        const response = await fetch(`${getSocketUrl()}/api/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
+        if (!response.ok) throw new Error(`Could not delete task ${task.id}`);
+      }));
+      const removed = new Set(finished.map(task => task.id));
+      setTasks(prev => prev.filter(task => !removed.has(task.id)));
+      tasksRef.current = tasksRef.current.filter(task => !removed.has(task.id));
+      if (selectedTaskId && removed.has(selectedTaskId)) setSelectedTaskId(null);
+    } catch (e: any) { addLog('general', `Clear finished tasks error: ${e.message}`, 'ERROR'); }
   };
 
   // --- SMART WORKFLOW ---
@@ -1259,6 +1493,7 @@ function App() {
     sessionRunningRef.current = true;
     setSmartWorkflowState(null);
     setActiveTab('dashboard');
+    let pendingTaskId: string | null = null;
 
     try {
       let targetPath = await prepareTarget();
@@ -1269,23 +1504,35 @@ function App() {
         return;
       }
 
-      const payload = buildWorkflowPayload(targetPath, opts);
+      const workflowTaskId = `task_${Date.now()}_${uuid()}`;
+      const payload = { ...buildWorkflowPayload(targetPath, opts), taskId: workflowTaskId };
+      const taskConfig = { ...config, targetPath };
+      const task = await persistNewTask({
+        id: workflowTaskId, targetPath,
+        targetSummary: manualTargetFile?.name || targetPath.split(/[\\/]/).pop() || targetPath,
+        config: taskConfig, workflowOpts: opts, status: 'QUEUED', createdAt: Date.now(), recovered: 0,
+      });
+      pendingTaskId = task.id;
+      clearDraftTarget();
 
       const res = await fetch(getSocketUrl() + '/api/smart-workflow/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, taskId: task.id }),
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Smart workflow could not start.');
       if (data.workflowId) {
         runningConfigs.current[data.workflowId] = config;
+        await updateTask(task.id, { status: 'RUNNING', sessionId: data.workflowId });
         updateSession(data.workflowId, { hashType: config.hashType });
         setActiveSessionId(data.workflowId);
       } else {
-        sessionRunningRef.current = false;
+        throw new Error(data.message || 'Smart workflow did not return a session id.');
       }
     } catch (e: any) {
       addLog('general', `Smart Workflow Error: ${e.message}`, 'ERROR');
+      if (pendingTaskId) void updateTask(pendingTaskId, { status: 'FAILED', endedAt: Date.now(), failureReason: e.message || String(e) });
       sessionRunningRef.current = false;
     } finally {
       setIsStarting(false);
@@ -1310,11 +1557,18 @@ function App() {
         return;
       }
       const queueConfig = { ...config, targetPath };
+      const taskId = `task_${Date.now()}_${uuid()}`;
+      const now = Date.now();
+      await persistNewTask({
+        id: taskId, targetPath, targetSummary: targetSummary || 'Unknown', config: queueConfig,
+        workflowOpts: opts, status: 'QUEUED', createdAt: now, recovered: 0,
+      });
+      clearDraftTarget();
       const newJob: QueueItem = {
-        id: uuid(),
+        id: taskId,
         config: queueConfig,
         status: 'PENDING',
-        addedAt: Date.now(),
+        addedAt: now,
         targetSummary: targetSummary || 'Unknown',
         workflowOpts: opts,
       };
@@ -1325,7 +1579,7 @@ function App() {
   };
 
   // --- MANUAL START ---
-  const toggleSession = async (overrideCommand?: string) => {
+  const toggleSession = async () => {
     if (activeSessionId && (session.status === SessionStatus.RUNNING || session.status === SessionStatus.PAUSED)) {
       await fetch(getSocketUrl() + '/api/session/stop', { 
           method: 'POST', 
@@ -1333,49 +1587,8 @@ function App() {
           body: JSON.stringify({ sessionId: activeSessionId })
       });
     } else {
-      if (!backendConnected) { addLog('general', "Backend disconnected.", "ERROR"); return; }
-      
-      sessionRunningRef.current = true;
-      setIsStarting(true);
-      setActiveTab('dashboard');
-      
-      try {
-        let targetPath = await prepareTarget();
-        if (!targetPath && !restoreMode && !overrideCommand) {
-            addLog('general', `Start Aborted: No target.`, 'ERROR');
-            sessionRunningRef.current = false;
-            setIsStarting(false);
-            return;
-        }
-
-        let payload = {};
-        if (restoreMode) {
-            payload = { restore: true };
-            addLog('general', `Attempting restore from previous session...`, 'CMD');
-        } else {
-            payload = overrideCommand ? { customCommand: overrideCommand } : { ...config, targetPath };
-        }
-        
-        const res = await fetch(getSocketUrl() + '/api/session/start', { 
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-        });
-        
-        const data = await res.json();
-        if (data.sessionId) {
-            runningConfigs.current[data.sessionId] = config;
-            updateSession(data.sessionId, { hashType: config.hashType });
-            // Clear any active workflow card — this is a regular session
-            setSmartWorkflowState(null);
-            setSmartPhase(null);
-        } else {
-             sessionRunningRef.current = false;
-        }
-      } catch (e: any) {
-        addLog('general', `Start Error: ${e.message}`, 'ERROR');
-        sessionRunningRef.current = false;
-      } finally {
-        setIsStarting(false);
-      }
+      if (!backendConnected) addLog('general', 'Backend disconnected.', 'ERROR');
+      else setActiveTab('config');
     }
   };
 
@@ -1458,7 +1671,7 @@ function App() {
             <div className="p-4 flex-1">
                 <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'dashboard' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}><LayoutDashboard size={20} /><span className="ml-3 hidden lg:block font-medium">{t('nav_dashboard')}</span></button>
                 <button onClick={() => setActiveTab('queue')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'queue' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}>
-                    <List size={20} /><div className="ml-3 hidden lg:flex items-center justify-between flex-1 font-medium"><span>{t('nav_queue')}</span>{jobQueue.length > 0 && <span className="bg-indigo-600 text-white text-[10px] px-1.5 py-0.5 rounded-full">{jobQueue.length}</span>}</div>
+                    <List size={20} /><div className="ml-3 hidden lg:flex items-center justify-between flex-1 font-medium"><span>{t('task_list_title')}</span>{tasks.length > 0 && <span className="bg-indigo-600 text-white text-[10px] px-1.5 py-0.5 rounded-full">{tasks.length}</span>}</div>
                 </button>
                 <button onClick={() => setActiveTab('insights')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'insights' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}><Microscope size={20} /><span className="ml-3 hidden lg:block font-medium">{t('nav_insights')}</span></button>
                 <button onClick={() => setActiveTab('escrow')} className={`w-full flex items-center p-3 rounded-lg transition-all mb-1 ${activeTab === 'escrow' ? 'bg-indigo-600/10 text-indigo-400 border border-indigo-600/20' : 'text-slate-400 hover:bg-slate-900'}`}><Globe size={20} /><span className="ml-3 hidden lg:block font-medium">{t('nav_escrow')}</span></button>
@@ -1668,12 +1881,11 @@ function App() {
                 }}
             />
 
-            {(!activeSessionId || session.status === SessionStatus.IDLE || session.status === SessionStatus.COMPLETED || session.status === SessionStatus.ERROR || session.status === SessionStatus.STOPPED) ? (
-              <div className="flex items-center gap-3 bg-slate-900 p-1 rounded-lg border border-slate-800">
-                  <button onClick={() => setRestoreMode(!restoreMode)} className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-bold transition-colors ${restoreMode ? 'bg-amber-500/20 text-amber-400' : 'text-slate-400 hover:text-slate-200'}`}><RefreshCw size={14} />{restoreMode ? t('restore_mode') : t('new_session')}</button>
-                  <button onClick={() => toggleSession()} disabled={isStarting || !backendConnected} className={`flex items-center gap-2 px-4 py-1.5 rounded-md font-medium text-sm transition-all ${restoreMode ? 'bg-amber-600 text-white hover:bg-amber-500' : 'bg-emerald-600 text-white hover:bg-emerald-500'}`}>{isStarting ? <Loader2 size={16} className="animate-spin"/> : <Play size={16} />}{restoreMode ? t('btn_restore') : t('btn_start')}</button>
-              </div>
-            ) : (<div className="flex items-center gap-2 bg-slate-900 p-1 rounded-lg border border-slate-800"><button onClick={() => toggleSession()} className="flex items-center gap-2 px-4 py-1.5 rounded-md font-medium text-sm bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors"><Square size={14} fill="currentColor" />{t('btn_stop')}</button></div>)}
+            {(status === SessionStatus.RUNNING || status === SessionStatus.PAUSED) ? (
+              <div className="flex items-center gap-2 bg-slate-900 p-1 rounded-lg border border-slate-800"><button onClick={() => toggleSession()} className="flex items-center gap-2 px-4 py-1.5 rounded-md font-medium text-sm bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors"><Square size={14} fill="currentColor" />{t('btn_stop')}</button></div>
+            ) : (
+              <button onClick={() => setActiveTab('config')} disabled={!backendConnected} className="flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50"><Play size={15} />{t('task_configure_start')}</button>
+            )}
           </div>
         </header>
 
@@ -1693,24 +1905,24 @@ function App() {
                 </div>
                 <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 lg:h-80 min-h-[20rem]">
                   <div className="lg:col-span-3 h-full min-h-0 rounded-xl overflow-hidden"><CpuChart data={history} color="#6366f1" title={t('card_hashrate') + " (MH/s)"} dataKey="hashrate" unit="M" /></div>
-                  <div className="lg:col-span-2 h-full min-h-0 rounded-xl overflow-hidden"><LogTerminal logs={logs} sessions={sessions} activeSessionId={activeSessionId} onSelectSession={setActiveSessionId} onDeleteSession={deleteSession}/></div>
+                  <div className="lg:col-span-2 h-full min-h-0 rounded-xl overflow-hidden"><LogTerminal logs={logs} sessions={sessions} activeSessionId={activeSessionId} onSelectSession={setActiveSessionId} onDeleteSession={deleteSession} showSessionList={false}/></div>
                 </div>
 
                 <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 xl:h-[32rem]">
                     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 flex flex-col h-full relative overflow-hidden">
-                        {activeSessionId && (<div className="absolute inset-0 bg-slate-950/60 z-10 flex items-center justify-center backdrop-blur-[1px]"><div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-2xl text-center"><div className="flex items-center justify-center gap-2 text-indigo-400 mb-2"><Hash size={24} /><span className="font-bold text-lg">{t('target_locked')}</span></div><p className="text-slate-400 text-sm mb-1">{t('target_locked_desc')}</p><div className="font-mono text-white bg-slate-950 px-3 py-1 rounded border border-slate-800 text-xs inline-block mt-2">{session.target || t('target_manual')}</div></div></div>)}
-                        <div className="flex items-center gap-2 mb-4 shrink-0"><FileUp size={18} className="text-indigo-400" /><h3 className="text-sm font-bold text-slate-200">{t('target_config_header')} {activeSessionId ? t('target_locked_status') : t('target_new_status')}</h3></div>
+                        {isSessionTargetLocked && (<div className="absolute inset-0 bg-slate-950/60 z-10 flex items-center justify-center backdrop-blur-[1px]"><div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-2xl text-center"><div className="flex items-center justify-center gap-2 text-indigo-400 mb-2"><Hash size={24} /><span className="font-bold text-lg">{t('target_locked')}</span></div><p className="text-slate-400 text-sm mb-1">{t('target_locked_desc')}</p><div className="font-mono text-white bg-slate-950 px-3 py-1 rounded border border-slate-800 text-xs inline-block mt-2">{session.target || t('target_manual')}</div></div></div>)}
+                        <div className="flex items-center gap-2 mb-4 shrink-0"><FileUp size={18} className="text-indigo-400" /><h3 className="text-sm font-bold text-slate-200">{t('target_config_header')} {isSessionTargetLocked ? t('target_locked_status') : t('target_new_status')}</h3></div>
                         <div className="flex flex-col gap-4">
                              <div className="flex gap-4 shrink-0 h-12">
-                                <label className={`flex-1 flex items-center justify-center border border-dashed rounded-lg transition-colors ${!activeSessionId ? 'cursor-pointer hover:bg-slate-800/50' : 'cursor-not-allowed opacity-50'} ${manualTargetFile ? 'bg-indigo-500/10 border-indigo-500/50 text-indigo-300' : 'border-slate-700 text-slate-400'}`}>
+                                <label className={`flex-1 flex items-center justify-center border border-dashed rounded-lg transition-colors ${!isSessionTargetLocked ? 'cursor-pointer hover:bg-slate-800/50' : 'cursor-not-allowed opacity-50'} ${manualTargetFile ? 'bg-indigo-500/10 border-indigo-500/50 text-indigo-300' : 'border-slate-700 text-slate-400'}`}>
                                     <span className="text-xs font-medium truncate px-2 flex items-center gap-2">{manualTargetFile ? <><FileUp size={14} />{manualTargetFile.name}</> : t('choose_file')}</span>
-                                    <input type="file" className="hidden" onChange={handleFileChange} disabled={!!activeSessionId} />
+                                    <input type="file" className="hidden" onChange={handleFileChange} disabled={isSessionTargetLocked} />
                                 </label>
-                                <button onClick={handleManualTargetLoad} disabled={(!manualTargetInput && !manualTargetFile) || !!activeSessionId} className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 text-white px-6 rounded-lg text-sm font-bold transition-colors">{t('set_target')}</button>
-                                <button onClick={handleCheckPotfile} disabled={(!manualTargetFile && !manualTargetInput) || isCheckingPotfile || !!activeSessionId} className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 border border-slate-700 px-4 rounded-lg text-xs font-bold transition-colors flex items-center gap-2">{isCheckingPotfile ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />}<span className="hidden xl:inline">{t('check_potfile')}</span></button>
+                                <button onClick={handleManualTargetLoad} disabled={(!manualTargetInput && !manualTargetFile) || isSessionTargetLocked} className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 text-white px-6 rounded-lg text-sm font-bold transition-colors">{t('set_target')}</button>
+                                <button onClick={handleCheckPotfile} disabled={(!manualTargetFile && !manualTargetInput) || isCheckingPotfile || isSessionTargetLocked} className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 border border-slate-700 px-4 rounded-lg text-xs font-bold transition-colors flex items-center gap-2">{isCheckingPotfile ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />}<span className="hidden xl:inline">{t('check_potfile')}</span></button>
                              </div>
                              <div className="relative text-center shrink-0"><div className="absolute inset-0 flex items-center"><span className="w-full border-t border-slate-800"></span></div><div className="relative"><span className="bg-slate-900 px-2 text-xs text-slate-500 font-bold">{t('paste_hashes')}</span></div></div>
-                             <div className="relative group h-60"><textarea value={manualTargetInput} onChange={(e) => { setManualTargetInput(e.target.value); if(e.target.value) setManualTargetFile(null); }} disabled={!!activeSessionId} placeholder={t('paste_placeholder')} className="w-full h-full bg-slate-950/50 border border-slate-800 rounded-lg p-4 font-mono text-xs text-slate-300 resize-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-50" /></div>
+                             <div className="relative group h-60"><textarea value={manualTargetInput} onChange={(e) => { setManualTargetInput(e.target.value); if(e.target.value) setManualTargetFile(null); }} disabled={isSessionTargetLocked} placeholder={t('paste_placeholder')} className="w-full h-full bg-slate-950/50 border border-slate-800 rounded-lg p-4 font-mono text-xs text-slate-300 resize-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-50" /></div>
                         </div>
                     </div>
                     <div className="flex flex-col relative h-full bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden">
@@ -1813,10 +2025,18 @@ function App() {
             {/* File2John Component */}
             {activeTab === 'file2john' && (
                 <File2John 
-                    onSetTarget={(hash) => {
-                        setManualTargetInput(hash);
-                        setManualTargetFile(null); 
-                        setActiveTab('dashboard'); 
+                    onSetTarget={async (hash, detectedMode) => {
+                        const response = await fetch(`${getSocketUrl()}/api/target`, {
+                          method: 'POST', headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ content: hash, filename: `extracted_hash_${Date.now()}.txt` }),
+                        });
+                        const data = await response.json();
+                        if (!response.ok || !data.path) throw new Error(data.message || 'Could not save extracted hash locally.');
+                        setManualTargetInput('');
+                        setManualTargetFile(null);
+                        setConfig(prev => ({ ...prev, targetPath: data.path, ...(detectedMode ? { hashType: String(detectedMode.id) } : {}) }));
+                        if (detectedMode) addLog('general', `[HASH] Detected ${detectedMode.name} (Mode ${detectedMode.id}) from extracted hash`, 'SUCCESS');
+                        else addLog('general', '[HASH] Hash was added as the target, but its mode could not be identified. Select the hash mode manually.', 'WARN');
                     }}
                     onNavigate={setActiveTab}
                 />
@@ -1826,7 +2046,7 @@ function App() {
                 <ConfigPanel
                     config={config}
                     setConfig={setConfig}
-                    onStart={(cmd) => { setActiveTab('dashboard'); if (status !== SessionStatus.RUNNING) toggleSession(cmd); }}
+                    onStart={(cmd) => { void handleStartTask(cmd); }}
                     onQueue={handleAddToQueue}
                     onStartWorkflow={handleStartSmartWorkflow}
                     onQueueWorkflow={handleQueueSmartWorkflow}
@@ -1834,7 +2054,23 @@ function App() {
                 />
             )}
             
-            {activeTab === 'queue' && (<QueueManager queue={jobQueue} removeFromQueue={(id) => setJobQueue(prev => prev.filter(j => j.id !== id))} isQueueProcessing={isQueueProcessing} setIsQueueProcessing={setIsQueueProcessing} clearQueue={() => setJobQueue([])} />)}
+            {activeTab === 'queue' && (<TaskManager
+              tasks={tasks}
+              selectedTaskId={selectedTaskId}
+              activeSessionId={activeSessionId}
+              sessions={sessions}
+              logs={logs}
+              cracks={currentDisplayedCracks}
+              queueEnabled={isQueueProcessing}
+              onToggleQueue={() => setIsQueueProcessing(value => !value)}
+              onSelectTask={task => { setSelectedTaskId(task.id); setActiveSessionId(task.sessionId || null); }}
+              onResume={handleResumeTask}
+              onStop={handleStopTask}
+              onDelete={handleDeleteTask}
+              onClearFinished={() => { void handleClearFinishedTasks(); }}
+              onSelectSession={setActiveSessionId}
+              onDeleteSession={deleteSession}
+            />)}
             {activeTab === 'terminal' && !isRemoteSession && (<div className="h-[80vh]"><InteractiveTerminal socket={socketRef.current} disabled={status === SessionStatus.RUNNING || status === SessionStatus.PAUSED} /></div>)}
             {activeTab === 'remote' && !isRemoteSession && (<RemoteAccess socket={socketRef.current} />)}
           </div>

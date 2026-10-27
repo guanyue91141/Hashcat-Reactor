@@ -83,6 +83,28 @@ export interface QueueItem {
   workflowOpts?: SmartWorkflowOpts; // present if this is a Smart Workflow job
 }
 
+export type ReactorTaskStatus = 'QUEUED' | 'RUNNING' | 'PAUSED' | 'INTERRUPTED' | 'COMPLETED' | 'FAILED' | 'STOPPED';
+
+export interface ReactorTask {
+  id: string;
+  targetPath?: string;
+  targetSummary: string;
+  config: HashcatConfig | null;
+  status: ReactorTaskStatus;
+  createdAt: number;
+  startedAt?: number;
+  endedAt?: number;
+  sessionId?: string;
+  recovered?: number;
+  totalHashes?: number;
+  exitCode?: number;
+  failureReason?: string;
+  resumeAvailable?: boolean;
+  workflowOpts?: SmartWorkflowOpts;
+  customCommand?: string;
+  legacy?: boolean;
+}
+
 // Hashes.com Interfaces
 export interface EscrowJob {
   id: number;
@@ -121,6 +143,10 @@ export interface HashcatConfig {
   rulePath: string;
   mask: string;
   maskFile: string; 
+  customCharset1?: string;
+  customCharset2?: string;
+  customCharset3?: string;
+  customCharset4?: string;
   
   // Increment Settings
   increment: boolean; // --increment (-i)

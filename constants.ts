@@ -29,6 +29,10 @@ export const DEFAULT_CONFIG: HashcatConfig = {
   rulePath: '',
   mask: '?a?a?a?a?a?a?a',
   maskFile: '',
+  customCharset1: '',
+  customCharset2: '',
+  customCharset3: '',
+  customCharset4: '',
   
   // Increment Settings
   increment: false,
@@ -57,12 +61,12 @@ export const DEFAULT_CONFIG: HashcatConfig = {
 };
 
 export const ATTACK_MODES = [
-  { id: 0, name: 'Straight (Dictionary)', desc: 'Standard wordlist attack' },
-  { id: 1, name: 'Combination', desc: 'Combine two dictionaries' },
-  { id: 3, name: 'Brute-Force', desc: 'Mask attack / Full keyspace' },
-  { id: 6, name: 'Hybrid Dict + Mask', desc: 'Wordlist + Append mask' },
-  { id: 7, name: 'Hybrid Mask + Dict', desc: 'Prepend mask + Wordlist' },
-  { id: 9, name: 'Association', desc: 'Association attack' }
+  { id: 0, name: 'Straight (Dictionary)', nameZh: '字典攻击', desc: 'Standard wordlist attack' },
+  { id: 1, name: 'Combination', nameZh: '组合攻击', desc: 'Combine two dictionaries' },
+  { id: 3, name: 'Brute-Force', nameZh: '掩码暴力攻击', desc: 'Mask attack / Full keyspace' },
+  { id: 6, name: 'Hybrid Dict + Mask', nameZh: '字典 + 追加掩码', desc: 'Wordlist + Append mask' },
+  { id: 7, name: 'Hybrid Mask + Dict', nameZh: '掩码 + 字典', desc: 'Prepend mask + Wordlist' },
+  { id: 9, name: 'Association', nameZh: '关联攻击', desc: 'Association attack' }
 ];
 
 export const HASH_TYPES = [

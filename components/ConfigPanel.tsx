@@ -270,6 +270,13 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
     if (config.ruleLeft) parts.push(`-j '${config.ruleLeft}'`);
     if (config.ruleRight) parts.push(`-k '${config.ruleRight}'`);
 
+    if ([3, 6, 7].includes(config.attackMode)) {
+      [config.customCharset1, config.customCharset2, config.customCharset3, config.customCharset4].forEach((charset, index) => {
+        const value = charset?.trim();
+        if (value) parts.push(`-${index + 1} "${value}"`);
+      });
+    }
+
     parts.push(config.targetPath || '[target]');
 
     const mode = config.attackMode;
@@ -420,6 +427,13 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
                 </div>
            </div>
 
+           <div className="mb-6">
+             <label className="block text-xs font-bold text-slate-500 mb-2 uppercase">{t('config_task_target')}</label>
+             <div className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-slate-300 truncate" title={config.targetPath || ''}>
+               {config.targetPath || t('task_no_target')}
+             </div>
+           </div>
+
            <div className="grid grid-cols-1 gap-6">
              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div>
@@ -429,7 +443,7 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
                     onChange={e => setConfig({...config, attackMode: parseInt(e.target.value)})}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 text-sm focus:border-indigo-500 outline-none transition-colors"
                   >
-                    {ATTACK_MODES.map(m => <option key={m.id} value={m.id}>{m.id} - {m.name}</option>)}
+                    {ATTACK_MODES.map(m => <option key={m.id} value={m.id}>{m.id} - {m.name}（{m.nameZh}）</option>)}
                   </select>
                 </div>
                 
@@ -639,6 +653,58 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config: propConfig, setConfig
                       <div>
                           <label className="block text-xs font-bold text-slate-500 mb-2">{t('config_mask_pattern')}</label>
                           <input type="text" value={config.mask} onChange={e => setConfig({...config, mask: e.target.value})} placeholder="Leave empty for Hashcat default or if using mask file" className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-300 font-mono text-sm focus:border-indigo-500 outline-none" />
+                          <details className="mt-2 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-400">
+                            <summary className="cursor-pointer select-none font-semibold text-indigo-300">{t('config_mask_help_title')}</summary>
+                            <div className="mt-3 space-y-3">
+                              <p>{t('config_mask_help_intro')}</p>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1">
+                                <div><code className="text-indigo-300">?l</code> — {t('config_mask_charset_lower')}</div>
+                                <div><code className="text-indigo-300">?u</code> — {t('config_mask_charset_upper')}</div>
+                                <div><code className="text-indigo-300">?d</code> — {t('config_mask_charset_digit')}</div>
+                                <div><code className="text-indigo-300">?s</code> — {t('config_mask_charset_symbol')}</div>
+                                <div><code className="text-indigo-300">?h</code> — {t('config_mask_charset_hex_lower')}</div>
+                                <div><code className="text-indigo-300">?H</code> — {t('config_mask_charset_hex_upper')}</div>
+                                <div><code className="text-indigo-300">?a</code> — {t('config_mask_charset_all')}</div>
+                                <div><code className="text-indigo-300">?b</code> — {t('config_mask_charset_byte')}</div>
+                              </div>
+                              <div>
+                                <div className="mb-1 font-semibold text-slate-300">{t('config_mask_examples_title')}</div>
+                                <div className="space-y-1 font-mono">
+                                  <div><code className="text-emerald-300">?a?a?a?a</code><span className="font-sans"> — {t('config_mask_example_any4')}</span></div>
+                                  <div><code className="text-emerald-300">?l?l?l?l?d?d</code><span className="font-sans"> — {t('config_mask_example_lower4_digit2')}</span></div>
+                                  <div><code className="text-emerald-300">?u?l?l?l?d?d</code><span className="font-sans"> — {t('config_mask_example_upper_lower_digit')}</span></div>
+                                  <div><code className="text-emerald-300">P@ss?d?d</code><span className="font-sans"> — {t('config_mask_example_fixed_prefix')}</span></div>
+                                </div>
+                              </div>
+                              <p className="text-slate-500">{t('config_mask_help_note')}</p>
+                            </div>
+                          </details>
+                          <details className="mt-2 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-400">
+                            <summary className="cursor-pointer select-none font-semibold text-indigo-300">{t('config_mask_custom_charset_title')}</summary>
+                            <div className="mt-3 space-y-3">
+                              <p>{t('config_mask_custom_charset_desc')}</p>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                {[
+                                  { index: 1, option: '-1', key: 'customCharset1' as const },
+                                  { index: 2, option: '-2', key: 'customCharset2' as const },
+                                  { index: 3, option: '-3', key: 'customCharset3' as const },
+                                  { index: 4, option: '-4', key: 'customCharset4' as const },
+                                ].map(({ index, option, key }) => (
+                                  <label key={key} className="block">
+                                    <span className="mb-1 block font-semibold text-slate-300">{t('config_mask_custom_charset_label', { index, option })}</span>
+                                    <input
+                                      type="text"
+                                      value={config[key] || ''}
+                                      onChange={event => setConfig({ ...config, [key]: event.target.value })}
+                                      placeholder={t('config_mask_custom_charset_placeholder')}
+                                      className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200 outline-none focus:border-indigo-500"
+                                    />
+                                  </label>
+                                ))}
+                              </div>
+                              <p className="text-slate-500">{t('config_mask_custom_charset_example')}</p>
+                            </div>
+                          </details>
                       </div>
                        <div>
                           <div className="flex justify-between items-center mb-2">

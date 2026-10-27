@@ -106,8 +106,8 @@ const TOOLS = [
 ];
 
 interface File2JohnProps {
-  onSetTarget: (hash: string) => void;
-  onNavigate: (tab: 'dashboard') => void;
+  onSetTarget: (hash: string, detectedMode?: { id: number; name: string }) => void | Promise<void>;
+  onNavigate: (tab: 'dashboard' | 'config') => void;
 }
 
 // --- API URL HELPER ---
@@ -121,12 +121,40 @@ const getApiUrl = (endpoint: string) => {
 
 const File2John: React.FC<File2JohnProps> = ({ onSetTarget, onNavigate }) => {
   const { t } = useTranslation();
+  const [inputMode, setInputMode] = useState<'file' | 'text'>('file');
   const [file, setFile] = useState<File | null>(null);
+  const [hashText, setHashText] = useState('');
   const [fileType, setFileType] = useState('auto');
   const [extractedHashes, setExtractedHashes] = useState<string[]>([]);
   const [activeHashIndex, setActiveHashIndex] = useState(0); 
   const [loading, setLoading] = useState(false);
+  const [usingHash, setUsingHash] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const handleUseHash = async (hash = activeHash) => {
+    if (!hash || usingHash) return;
+    setUsingHash(true);
+    let detectedMode: { id: number; name: string } | undefined;
+    try {
+      const response = await fetch(getApiUrl('/api/identify'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: hash })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Hash mode detection failed');
+      if (data.modes?.length > 0) detectedMode = data.modes[0];
+    } catch (err) {
+      console.error('[File2John] Hash mode detection failed:', err);
+    }
+    try {
+      await onSetTarget(hash, detectedMode);
+      onNavigate('config');
+    } catch (err) {
+      console.error('[File2John] Could not prepare extracted hash as a task target:', err);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally { setUsingHash(false); }
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -214,6 +242,26 @@ const File2John: React.FC<File2JohnProps> = ({ onSetTarget, onNavigate }) => {
   };
 
   const handleExtract = async () => {
+    if (inputMode === 'text') {
+      const hashes = [...new Set(hashText.split(/\r?\n/).map(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) return '';
+        // ssh2john prefixes each hash with the private-key filename. Hashcat
+        // expects the $sshng$ payload itself.
+        const sshHashOffset = trimmed.indexOf('$sshng$');
+        if (sshHashOffset >= 0) return trimmed.slice(sshHashOffset);
+        return trimmed.replace(/^[^:]+:(?=\$)/, '');
+      }).filter(Boolean))];
+      setError(null);
+      setExtractedHashes(hashes);
+      setActiveHashIndex(0);
+      if (hashes.length === 0) {
+        setError(t('extractor_err_no_hash'));
+        return;
+      }
+      await handleUseHash(hashes[0]);
+      return;
+    }
     if (!file) return;
     setLoading(true);
     setError(null);
@@ -265,24 +313,46 @@ const File2John: React.FC<File2JohnProps> = ({ onSetTarget, onNavigate }) => {
            </p>
         </div>
 
-        <div className="bg-slate-950 border-2 border-dashed border-slate-800 rounded-xl p-8 flex flex-col items-center justify-center text-center hover:border-indigo-500/50 transition-colors relative group">
-           <input type="file" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleFileChange} />
-           {file ? (
-             <div className="flex flex-col items-center gap-2 animate-in zoom-in-50">
-                <FileArchive size={48} className="text-emerald-500" />
-                <div className="font-mono text-slate-200 font-bold truncate max-w-[200px]">{file.name}</div>
-                <div className="text-xs text-slate-500">{(file.size / 1024).toFixed(1)} KB</div>
-             </div>
-           ) : (
-             <div className="flex flex-col items-center gap-2 text-slate-500 group-hover:text-slate-400">
-                <Upload size={32} />
-                <span className="text-sm font-medium">{t('extractor_drag_drop')}</span>
-             </div>
-           )}
+        <div className="grid grid-cols-2 gap-2 rounded-lg bg-slate-950 p-1">
+          <button type="button" onClick={() => setInputMode('file')} className={`rounded-md px-3 py-2 text-sm font-semibold transition-colors ${inputMode === 'file' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}>
+            {t('extractor_file_mode')}
+          </button>
+          <button type="button" onClick={() => setInputMode('text')} className={`rounded-md px-3 py-2 text-sm font-semibold transition-colors ${inputMode === 'text' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}>
+            {t('extractor_text_mode')}
+          </button>
         </div>
 
+        {inputMode === 'file' ? (
+          <div className="bg-slate-950 border-2 border-dashed border-slate-800 rounded-xl p-8 flex flex-col items-center justify-center text-center hover:border-indigo-500/50 transition-colors relative group">
+             <input type="file" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleFileChange} />
+             {file ? (
+               <div className="flex flex-col items-center gap-2 animate-in zoom-in-50">
+                  <FileArchive size={48} className="text-emerald-500" />
+                  <div className="font-mono text-slate-200 font-bold truncate max-w-[200px]">{file.name}</div>
+                  <div className="text-xs text-slate-500">{(file.size / 1024).toFixed(1)} KB</div>
+               </div>
+             ) : (
+               <div className="flex flex-col items-center gap-2 text-slate-500 group-hover:text-slate-400">
+                  <Upload size={32} />
+                  <span className="text-sm font-medium">{t('extractor_drag_drop')}</span>
+               </div>
+             )}
+          </div>
+        ) : (
+          <div className="flex flex-1 min-h-[180px] flex-col gap-2">
+            <label htmlFor="hash-extractor-text" className="text-xs font-bold text-slate-500 uppercase">{t('extractor_text_label')}</label>
+            <textarea
+              id="hash-extractor-text"
+              value={hashText}
+              onChange={event => setHashText(event.target.value)}
+              placeholder={t('extractor_text_placeholder')}
+              className="min-h-[180px] flex-1 resize-y rounded-xl border border-slate-800 bg-slate-950 p-3 font-mono text-xs text-slate-200 outline-none placeholder:text-slate-600 focus:border-indigo-500"
+            />
+          </div>
+        )}
+
         <div className="space-y-4">
-           <div>
+           {inputMode === 'file' && <div>
              <label className="text-xs font-bold text-slate-500 uppercase block mb-1">{t('extractor_target_format')}</label>
              <div className="relative">
                <select 
@@ -303,10 +373,10 @@ const File2John: React.FC<File2JohnProps> = ({ onSetTarget, onNavigate }) => {
                <Settings size={14} className="absolute right-3 top-3 text-slate-500 pointer-events-none"/>
              </div>
              <p className="text-[11px] text-slate-600 mt-2 leading-relaxed">{t('extractor_wsl_note')}</p>
-           </div>
+           </div>}
 
-           <button onClick={handleExtract} disabled={!file || loading} className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg font-bold flex justify-center items-center gap-2 shadow-lg shadow-indigo-900/20">
-             {loading ? <Loader2 className="animate-spin" size={16} /> : <Terminal size={16} />}
+           <button onClick={handleExtract} disabled={(inputMode === 'file' ? !file : !hashText.trim()) || loading || usingHash} className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg font-bold flex justify-center items-center gap-2 shadow-lg shadow-indigo-900/20">
+             {loading || usingHash ? <Loader2 className="animate-spin" size={16} /> : <Terminal size={16} />}
              {t('extractor_btn_extract')}
            </button>
         </div>
@@ -331,8 +401,8 @@ const File2John: React.FC<File2JohnProps> = ({ onSetTarget, onNavigate }) => {
                    <button onClick={() => navigator.clipboard.writeText(activeHash)} className="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-300 transition-colors flex items-center gap-2">
                       <Copy size={12} /> {t('extractor_btn_copy')}
                    </button>
-                   <button onClick={() => { onSetTarget(activeHash); onNavigate('dashboard'); }} className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-bold text-white transition-colors flex items-center gap-2">
-                      <Shield size={12} /> {t('extractor_btn_use')}
+                   <button onClick={() => { void handleUseHash(); }} disabled={usingHash} className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-xs font-bold text-white transition-colors flex items-center gap-2">
+                      {usingHash ? <Loader2 size={12} className="animate-spin" /> : <Shield size={12} />} {t('extractor_btn_use')}
                    </button>
                  </>
                )}

@@ -35,6 +35,36 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const POTFILE_PATH = path.join(uploadDir, 'reactor.potfile');
 const SESSIONS_PATH = path.join(uploadDir, 'sessions.json');
+const TASKS_PATH = path.join(uploadDir, 'tasks.json');
+
+const readTasks = () => {
+    try {
+        const data = JSON.parse(fs.readFileSync(TASKS_PATH, 'utf-8'));
+        return Array.isArray(data) ? data : [];
+    } catch (e) { return []; }
+};
+
+const writeTasks = (tasks) => {
+    const tempPath = `${TASKS_PATH}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(tasks, null, 2));
+    fs.renameSync(tempPath, TASKS_PATH);
+};
+
+const writeSessionHistory = (sessions) => {
+    const tempPath = `${SESSIONS_PATH}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(sessions, null, 2));
+    fs.renameSync(tempPath, SESSIONS_PATH);
+};
+
+const patchTaskRecord = (taskId, updates) => {
+    if (!taskId) return;
+    const tasks = readTasks();
+    const task = tasks.find(item => item.id === taskId);
+    if (!task) return;
+    Object.assign(task, updates);
+    try { writeTasks(tasks); }
+    catch (e) { console.error(`[Tasks] Could not persist ${taskId}:`, e.message); }
+};
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
@@ -627,6 +657,34 @@ const parsePotfileLine = (line) => {
         };
     }
     return null;
+};
+
+const findPotfileMatchesForTarget = async (targetPath, potfilePath) => {
+    const potfileMap = new Map();
+    let total = 0;
+    const matches = [];
+    const matchedHashes = new Set();
+    if (!targetPath || !fs.existsSync(targetPath) || !fs.existsSync(potfilePath)) {
+        return { total, matches };
+    }
+
+    const potRl = readline.createInterface({ input: fs.createReadStream(potfilePath), crlfDelay: Infinity });
+    for await (const line of potRl) {
+        const parsed = parsePotfileLine(line);
+        if (parsed) potfileMap.set(parsed.hash, parsed.plain);
+    }
+
+    const targetRl = readline.createInterface({ input: fs.createReadStream(targetPath), crlfDelay: Infinity });
+    for await (const line of targetRl) {
+        const hash = line.trim();
+        if (!hash) continue;
+        total++;
+        if (potfileMap.has(hash) && !matchedHashes.has(hash)) {
+            matches.push({ hash, plain: potfileMap.get(hash) });
+            matchedHashes.add(hash);
+        }
+    }
+    return { total, matches };
 };
 
 const getFullPotfile = () => {
@@ -1226,15 +1284,47 @@ app.post('/api/fs/scan', (req, res) => {
 });
 
 app.post('/api/identify', (req, res) => {
-  const { targetPath } = req.body;
-  if (!targetPath) return res.status(400).json({ message: 'Target path required' });
+  const { targetPath, content } = req.body;
+  let identifyPath = targetPath;
+  let tempDir = null;
+  if (typeof content === 'string') {
+    const hashContent = content.trim();
+    if (!hashContent) return res.status(400).json({ message: 'Hash content required' });
+    if (Buffer.byteLength(hashContent, 'utf8') > 5 * 1024 * 1024) {
+      return res.status(413).json({ message: 'Hash content is too large' });
+    }
+    try {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hashcat-reactor-identify-'));
+      identifyPath = path.join(tempDir, 'hash.txt');
+      fs.writeFileSync(identifyPath, `${hashContent}\n`, 'utf8');
+    } catch (e) {
+      if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+      return res.status(500).json({ message: `Could not prepare hash for identification: ${e.message}` });
+    }
+  }
+  if (!identifyPath) return res.status(400).json({ message: 'Target path or hash content required' });
   const { executable, cwd } = getHashcatConfig();
-  const args = [targetPath, '--identify'];
-  const proc = spawn(executable, args, { cwd });
+  const args = [identifyPath, '--identify'];
   let output = '';
+  const cleanup = () => {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  };
+  let proc;
+  try {
+    proc = spawn(executable, args, { cwd });
+  } catch (e) {
+    cleanup();
+    return res.status(500).json({ message: `Could not start hash identification: ${e.message}` });
+  }
   proc.stdout.on('data', (d) => output += d.toString());
   proc.stderr.on('data', (d) => output += d.toString());
+  proc.on('error', (e) => {
+    cleanup();
+    if (!res.headersSent) res.status(500).json({ message: `Could not start hash identification: ${e.message}` });
+  });
   proc.on('close', () => {
+    cleanup();
+    if (res.headersSent) return;
     const modes = [];
     const lines = output.split('\n');
     const modeRegex = /^\s*(\d+)\s+\|\s+([^|]+)/;
@@ -1246,8 +1336,8 @@ app.post('/api/identify', (req, res) => {
   });
 });
 
-app.post('/api/session/start', (req, res) => {
-  const { customCommand, targetPath, restore, sessionId: reqSessionId, ...config } = req.body;
+app.post('/api/session/start', async (req, res) => {
+  const { customCommand, targetPath, restore, sessionId: reqSessionId, taskId, ...config } = req.body;
   const { executable, cwd } = getHashcatConfig(); 
   let sessionId = reqSessionId;
 
@@ -1264,6 +1354,9 @@ app.post('/api/session/start', (req, res) => {
           } catch (e) {}
       }
       if (!sessionId) return res.status(400).json({ message: 'No restore file found.' });
+      if (!fs.existsSync(path.join(cwd, `${sessionId}.restore`))) {
+          return res.status(404).json({ message: `Hashcat restore file for ${sessionId} was not found.` });
+      }
   } else {
       if (!sessionId) {
           sessionCounter++;
@@ -1285,6 +1378,19 @@ app.post('/api/session/start', (req, res) => {
           initialSize = fs.statSync(sessionPotFile).size;
       } else { fs.writeFileSync(sessionPotFile, ''); }
   } catch (e) {}
+
+  // Hashcat skips hashes already present in the session potfile and emits no
+  // crack event for them. Since the session potfile starts as a copy of the
+  // global potfile, explicitly associate matching target entries with this
+  // session so the recovered-hash panel and final counts reflect the result.
+  let preCracked = { total: 0, matches: [] };
+  if (!restore && targetPath) {
+      try {
+          preCracked = await findPotfileMatchesForTarget(targetPath, sessionPotFile);
+      } catch (e) {
+          console.warn(`[Potfile] Could not match existing cracks for ${sessionId}:`, e.message);
+      }
+  }
 
   // On restore, prepare a replay of the sidecar so the frontend's recovered-
   // hash list is repopulated from the previous run before any new cracks come
@@ -1339,6 +1445,12 @@ app.post('/api/session/start', (req, res) => {
     if (config.keepGuessing) args.push('--keep-guessing');
     if (config.logfileDisable) args.push('--logfile-disable');
     if (config.force) args.push('--force');
+    if ([3, 6, 7].includes(Number(config.attackMode))) {
+        for (let index = 1; index <= 4; index++) {
+            const charset = config[`customCharset${index}`];
+            if (typeof charset === 'string' && charset.trim()) args.push(`-${index}`, charset.trim());
+        }
+    }
     if (config.bitmapMax && config.bitmapMax !== 24) args.push(`--bitmap-max=${config.bitmapMax}`);
     if (config.skip && config.skip > 0) args.push('-s', config.skip.toString());
     if (config.increment) {
@@ -1409,6 +1521,7 @@ app.post('/api/session/start', (req, res) => {
                 let statusEnum = 'RUNNING';
                 if (currentStatus === 'PAUSED') statusEnum = 'PAUSED';
                 else if (currentStatus === 'EXHAUSTED' || currentStatus === 'QUIT') statusEnum = 'COMPLETED';
+                if (activeSessions[sessionId] && activeSessions[sessionId].status !== 'STOPPED') activeSessions[sessionId].status = statusEnum;
                 io.emit('session_status', { sessionId, status: statusEnum });
             }
             const speedRegex = /Speed\.#(\*|\d+).*?:\s+([\d\.]+)\s+([a-zA-Z]+\/s)/i;
@@ -1473,6 +1586,8 @@ app.post('/api/session/start', (req, res) => {
   const handleProcessExit = (code) => {
       let duration = 0;
       let finalStats = { recovered: 0, total: 0, avgHashrate: 0, avgPower: 0 };
+      const taskId = activeSessions[sessionId]?.taskId;
+      const stopped = activeSessions[sessionId]?.status === 'STOPPED';
       if (activeSessions[sessionId]) {
           const s = activeSessions[sessionId];
           const endTime = Date.now();
@@ -1488,10 +1603,12 @@ app.post('/api/session/start', (req, res) => {
                   Object.entries(speeds).filter(([k]) => !isNaN(parseInt(k))).reduce((acc, [, v]) => acc + v, 0);
           }
           const avgPwr = s.stats.powerReadings > 0 ? s.stats.powerSum / s.stats.powerReadings : 0;
-          finalStats = { recovered: s.stats.recoveredCount, total: s.stats.total, avgHashrate: avg, avgPower: avgPwr };
+          finalStats = { recovered: s.stats.recoveredCount, total: s.stats.total || preCracked.total, avgHashrate: avg, avgPower: avgPwr };
       }
+      const taskStatus = stopped ? 'STOPPED' : (activeSessions[sessionId]?.status === 'COMPLETED' || code === 0) ? 'COMPLETED' : 'FAILED';
+      patchTaskRecord(taskId, { status: taskStatus, endedAt: Date.now(), exitCode: code, recovered: finalStats.recovered, totalHashes: finalStats.total });
       io.emit('log', { sessionId, level: code === 0 ? 'SUCCESS' : 'WARN', message: `Session ${friendlyName} exited with code ${code}` });
-      io.emit('session_finished', { sessionId, duration, ...finalStats });
+      io.emit('session_finished', { sessionId, taskId, duration, code, ...finalStats });
       io.emit('session_status', { sessionId, status: 'IDLE' }); 
       fs.unwatchFile(sessionPotFile);
       if (fs.existsSync(sessionPotFile)) { try { fs.unlinkSync(sessionPotFile); } catch(e) {} }
@@ -1537,12 +1654,21 @@ app.post('/api/session/start', (req, res) => {
         algorithmName: null,
         status: 'RUNNING',
         isWorkflow: false,
-        stats: { recovered: 0, recoveredCount: 0, total: 0, hashrateSum: 0, hashrateCount: 0, latestSpeeds: {}, powerSum: 0, powerReadings: 0 }
+    taskId,
+        stats: { recovered: preCracked.matches.length, recoveredCount: preCracked.matches.length, total: preCracked.total, hashrateSum: 0, hashrateCount: 0, latestSpeeds: {}, powerSum: 0, powerReadings: 0 }
     };
 
-    io.emit('session_started', { sessionId, name: friendlyName, target: targetPath ? path.basename(targetPath) : 'Manual Input', hashType: config.hashType, attackMode: config.attackMode });
+    io.emit('session_started', { sessionId, taskId, name: friendlyName, target: targetPath ? path.basename(targetPath) : 'Manual Input', hashType: config.hashType, attackMode: config.attackMode });
     io.emit('session_status', { sessionId, status: 'RUNNING' });
+    if (preCracked.total > 0) {
+        io.emit('stats_update', { sessionId, type: 'recovered', value: preCracked.matches.length });
+        io.emit('stats_update', { sessionId, type: 'total', value: preCracked.total });
+    }
     io.emit('log', { sessionId, level: 'CMD', message: `[${friendlyName}] Started via ${type}` });
+    if (preCracked.matches.length > 0) {
+        preCracked.matches.forEach(({ hash, plain }) => io.emit('session_crack', { sessionId, hash, plain }));
+        io.emit('log', { sessionId, level: 'SUCCESS', message: `[Potfile] Loaded ${preCracked.matches.length} previously recovered hash${preCracked.matches.length === 1 ? '' : 'es'} for this target.` });
+    }
     // Replay previously recovered hashes for restored sessions. Must run after
     // session_started so the frontend has a sessions[sessionId] entry to merge
     // session_crack events into.
@@ -1810,7 +1936,7 @@ const generateSmartAssets = (outfilePath, {
 
 app.post('/api/smart-workflow/start', (req, res) => {
     const {
-        targetPath, hashType, wordlistPath, initialRulePath,
+        targetPath, hashType, wordlistPath, initialRulePath, taskId,
         // ── Global performance / hardware (mirrors regular session logic) ──
         workloadProfile = 3,
         devices,
@@ -1961,6 +2087,7 @@ app.post('/api/smart-workflow/start', (req, res) => {
                     algorithmName: null,
                     status: 'RUNNING',
                     isWorkflow: true,
+                    taskId,
                     stats: prevStats,
                 };
             } catch(e) {
@@ -1973,7 +2100,7 @@ app.post('/api/smart-workflow/start', (req, res) => {
     res.json({ success: true, workflowId });
     sessionCounter++;
     activeWorkflows[workflowId] = { aborted: false };
-    io.emit('session_started', { sessionId: workflowId, name: `Smart Workflow (${hashType})`, target: path.basename(targetPath), hashType, attackMode: 0 });
+    io.emit('session_started', { sessionId: workflowId, taskId, name: `Smart Workflow (${hashType})`, target: path.basename(targetPath), hashType, attackMode: 0 });
     io.emit('session_status', { sessionId: workflowId, status: 'RUNNING' });
 
     (async () => {
@@ -2044,6 +2171,7 @@ app.post('/api/smart-workflow/start', (req, res) => {
                 const swStatsE = swSessE?.stats || {};
                 const swHrE = (swStatsE.hashrateCount || 0) > 0 ? swStatsE.hashrateSum / swStatsE.hashrateCount : 0;
                 const swPwrE = (swStatsE.powerReadings || 0) > 0 ? swStatsE.powerSum / swStatsE.powerReadings : 0;
+                patchTaskRecord(taskId, { status: 'COMPLETED', endedAt: Date.now(), exitCode: 0, recovered: swStatsE.recoveredCount || 0, totalHashes: swStatsE.total || 0 });
                 io.emit('session_finished', { sessionId: workflowId, duration: swDurE, recovered: swStatsE.recoveredCount || 0, total: swStatsE.total || 0, avgHashrate: swHrE, avgPower: swPwrE });
                 return;
             }
@@ -2216,6 +2344,8 @@ app.post('/api/smart-workflow/start', (req, res) => {
             }
 
             emitPhase(4, 'Smart Workflow complete!', { complete: true, maskFileId: workflowId });
+            const completedStats = activeSessions[workflowId]?.stats || {};
+            patchTaskRecord(taskId, { status: 'COMPLETED', endedAt: Date.now(), exitCode: 0, recovered: completedStats.recoveredCount || 0, totalHashes: completedStats.total || 0 });
             io.emit('session_status', { sessionId: workflowId, status: 'COMPLETED' });
             {
                 const swSess = activeSessions[workflowId];
@@ -2223,11 +2353,14 @@ app.post('/api/smart-workflow/start', (req, res) => {
                 const swStats = swSess?.stats || {};
                 const swAvgHashrate = (swStats.hashrateCount || 0) > 0 ? swStats.hashrateSum / swStats.hashrateCount : 0;
                 const swAvgPower = (swStats.powerReadings || 0) > 0 ? swStats.powerSum / swStats.powerReadings : 0;
-                io.emit('session_finished', { sessionId: workflowId, duration: swDuration, recovered: swStats.recoveredCount || 0, total: swStats.total || 0, avgHashrate: swAvgHashrate, avgPower: swAvgPower });
+                io.emit('session_finished', { sessionId: workflowId, taskId, duration: swDuration, code: 0, recovered: swStats.recoveredCount || 0, total: swStats.total || 0, avgHashrate: swAvgHashrate, avgPower: swAvgPower });
             }
         } catch (e) {
             const isAbort = e.message === '__ABORTED__';
+            const finalTaskStatus = isAbort ? 'STOPPED' : 'FAILED';
             io.emit('log', { sessionId: workflowId, level: isAbort ? 'WARN' : 'ERROR', message: isAbort ? '[Smart Workflow] Stopped by user.' : `Smart Workflow Error: ${e.message}` });
+            const failedStats = activeSessions[workflowId]?.stats || {};
+            patchTaskRecord(taskId, { status: finalTaskStatus, endedAt: Date.now(), failureReason: isAbort ? undefined : e.message, exitCode: isAbort ? 1 : 2, recovered: failedStats.recoveredCount || 0, totalHashes: failedStats.total || 0 });
             io.emit('session_status', { sessionId: workflowId, status: isAbort ? 'STOPPED' : 'ERROR' });
             {
                 const swSess = activeSessions[workflowId];
@@ -2235,7 +2368,7 @@ app.post('/api/smart-workflow/start', (req, res) => {
                 const swStats = swSess?.stats || {};
                 const swAvgHashrate = (swStats.hashrateCount || 0) > 0 ? swStats.hashrateSum / swStats.hashrateCount : 0;
                 const swAvgPower = (swStats.powerReadings || 0) > 0 ? swStats.powerSum / swStats.powerReadings : 0;
-                io.emit('session_finished', { sessionId: workflowId, duration: swDuration, recovered: swStats.recoveredCount || 0, total: swStats.total || 0, avgHashrate: swAvgHashrate, avgPower: swAvgPower });
+                io.emit('session_finished', { sessionId: workflowId, taskId, duration: swDuration, code: isAbort ? 1 : 2, recovered: swStats.recoveredCount || 0, total: swStats.total || 0, avgHashrate: swAvgHashrate, avgPower: swAvgPower });
             }
         } finally {
             fs.unwatchFile(sessionPotFile);
@@ -2255,6 +2388,7 @@ app.post('/api/session/stop', (req, res) => {
           const s = activeSessions[id];
           // Signal smart workflow to abort between phases
           if (s.isWorkflow && activeWorkflows[id]) activeWorkflows[id].aborted = true;
+          s.status = 'STOPPED';
           // Kill the process.  For regular (non-workflow) sessions we intentionally leave
           // activeSessions[id] intact so that handleProcessExit fires with the full stats
           // and emits session_finished with the real duration, hashrate and recovered count.
@@ -2264,6 +2398,7 @@ app.post('/api/session/stop', (req, res) => {
               if (s.type === 'pty') s.process.kill();
               else s.process.kill('SIGKILL');
           } catch(e) {}
+          patchTaskRecord(s.taskId, { status: 'STOPPED', endedAt: Date.now(), failureReason: 'Stopped by user' });
           io.emit('log', { sessionId: id, level: 'WARN', message: `Session ${s.name} stopped manually.` });
           io.emit('session_status', { sessionId: id, status: 'STOPPED' });
           return s.name;
@@ -2386,6 +2521,118 @@ app.get('/api/download/check-result/:filename', (req, res) => {
     const filePath = path.join(uploadDir, filename);
     if (fs.existsSync(filePath)) res.download(filePath);
     else res.status(404).send("File not found");
+});
+
+app.get('/api/tasks', (req, res) => {
+    try {
+        const tasks = readTasks();
+        let sessions = [];
+        if (fs.existsSync(SESSIONS_PATH)) {
+            try { sessions = JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf-8')); } catch (e) {}
+        }
+
+        // Make existing session history visible in the task list without inventing
+        // configuration or target data that the older history format never stored.
+        const knownSessions = new Set(tasks.map(task => task.sessionId).filter(Boolean));
+        let changed = false;
+        for (const [sessionId, active] of Object.entries(activeSessions)) {
+            if (knownSessions.has(sessionId)) continue;
+            const persistedTask = tasks.find(task => task.id === active.taskId);
+            if (persistedTask) {
+                persistedTask.sessionId = sessionId;
+                persistedTask.status = active.status === 'PAUSED' ? 'PAUSED' : 'RUNNING';
+                persistedTask.startedAt = persistedTask.startedAt || active.startTime || Date.now();
+                knownSessions.add(sessionId);
+                changed = true;
+                continue;
+            }
+            tasks.push({
+                id: `legacy_${sessionId}`,
+                targetSummary: active.name || 'Active Hashcat session',
+                config: null,
+                status: active.status === 'PAUSED' ? 'PAUSED' : 'RUNNING',
+                createdAt: active.startTime || Date.now(),
+                startedAt: active.startTime || Date.now(),
+                sessionId,
+                legacy: true,
+            });
+            knownSessions.add(sessionId);
+        }
+        for (const session of sessions) {
+            const sessionId = session.sessionId || session.id;
+            if (!sessionId || knownSessions.has(sessionId)) continue;
+            const date = new Date(session.date || Date.now()).getTime();
+            tasks.push({
+                id: `legacy_${sessionId}`,
+                targetSummary: session.target || session.mode || 'Historical session',
+                config: null,
+                status: 'COMPLETED',
+                createdAt: Number.isFinite(date) ? date : Date.now(),
+                endedAt: Number.isFinite(date) ? date : Date.now(),
+                sessionId,
+                recovered: session.recovered || 0,
+                totalHashes: session.totalHashes || 0,
+                legacy: true,
+            });
+            knownSessions.add(sessionId);
+        }
+
+        const { cwd } = getHashcatConfig();
+        for (const task of tasks) {
+            if ((task.status === 'RUNNING' || task.status === 'PAUSED') && task.sessionId && !activeSessions[task.sessionId]) {
+                task.status = 'INTERRUPTED';
+                task.endedAt = undefined;
+                task.failureReason = 'Reactor/backend stopped while this task was running';
+                task.resumeAvailable = !task.workflowOpts && fs.existsSync(path.join(cwd, `${task.sessionId}.restore`));
+                changed = true;
+            }
+        }
+        if (changed || !fs.existsSync(TASKS_PATH) || tasks.some(task => task.legacy)) writeTasks(tasks);
+        res.json(tasks.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
+    } catch (e) { res.status(500).json({ message: `Failed to load tasks: ${e.message}` }); }
+});
+
+app.post('/api/tasks', (req, res) => {
+    const task = req.body;
+    if (!task || typeof task.id !== 'string' || !task.id || typeof task.targetSummary !== 'string') {
+        return res.status(400).json({ message: 'A task id and target summary are required.' });
+    }
+    const tasks = readTasks();
+    if (tasks.some(item => item.id === task.id)) return res.status(409).json({ message: 'Task already exists.' });
+    const record = { ...task, status: task.status || 'QUEUED', createdAt: task.createdAt || Date.now() };
+    tasks.unshift(record);
+    try { writeTasks(tasks); res.status(201).json(record); }
+    catch (e) { res.status(500).json({ message: `Failed to save task: ${e.message}` }); }
+});
+
+app.patch('/api/tasks/:id', (req, res) => {
+    const tasks = readTasks();
+    const task = tasks.find(item => item.id === req.params.id);
+    if (!task) return res.status(404).json({ message: 'Task not found.' });
+    Object.assign(task, req.body || {});
+    try { writeTasks(tasks); res.json(task); }
+    catch (e) { res.status(500).json({ message: `Failed to update task: ${e.message}` }); }
+});
+
+app.delete('/api/tasks/:id', (req, res) => {
+    const tasks = readTasks();
+    const task = tasks.find(item => item.id === req.params.id);
+    if (!task) return res.status(404).json({ message: 'Task not found.' });
+    if (task.status === 'RUNNING' || task.status === 'PAUSED') {
+        return res.status(409).json({ message: 'Stop the running task before deleting it.' });
+    }
+    try {
+        // Session history is also used to import legacy task rows. Remove the
+        // linked entry for every deleted task, or it would reappear as legacy.
+        if (task.sessionId && fs.existsSync(SESSIONS_PATH)) {
+            const sessions = JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf-8'));
+            const remainingSessions = sessions.filter(session => (session.sessionId || session.id) !== task.sessionId);
+            if (remainingSessions.length !== sessions.length) writeSessionHistory(remainingSessions);
+        }
+        writeTasks(tasks.filter(item => item.id !== req.params.id));
+        res.json({ success: true });
+    }
+    catch (e) { res.status(500).json({ message: `Failed to delete task: ${e.message}` }); }
 });
 
 app.get('/api/history/sessions', (req, res) => {
